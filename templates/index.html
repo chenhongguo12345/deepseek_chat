@@ -1,0 +1,747 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DeepSeek 结构化对话</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        .chat-container {
+            width: 100%;
+            max-width: 720px;
+            height: 80vh;
+            background: #ffffff;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            position: relative;
+        }
+        .chat-header {
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 18px 24px;
+            font-size: 17px;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .chat-header .dot {
+            width: 10px; height: 10px; border-radius: 50%;
+            background: #4ade80; box-shadow: 0 0 8px #4ade80;
+        }
+        .chat-messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            background: #f7f7fa;
+        }
+        .msg {
+            display: flex;
+            flex-direction: column;
+            max-width: 85%;
+        }
+        .msg.user { align-self: flex-end; align-items: flex-end; }
+        .msg.ai { align-self: flex-start; align-items: flex-start; }
+        .bubble {
+            padding: 12px 16px;
+            border-radius: 16px;
+            font-size: 15px;
+            line-height: 1.5;
+            word-break: break-word;
+        }
+        .msg.user .bubble {
+            background: #667eea;
+            color: white;
+            border-bottom-right-radius: 4px;
+        }
+        .msg.ai .bubble {
+            background: white;
+            color: #1a1a1a;
+            border: 1px solid #e5e5ea;
+            border-bottom-left-radius: 4px;
+        }
+        .meta {
+            margin-top: 6px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            font-size: 12px;
+        }
+        .tag {
+            background: #eef2ff;
+            color: #4f46e5;
+            padding: 3px 9px;
+            border-radius: 10px;
+            border: 1px solid #c7d2fe;
+        }
+        .tag.intent { background: #fef3c7; color: #92400e; border-color: #fde68a; }
+        .tag.confidence { background: #dcfce7; color: #166534; border-color: #bbf7d0; }
+        .tag.keywords { background: #f3e8ff; color: #6b21a8; border-color: #e9d5ff; }
+        .tag.error { background: #fee2e2; color: #991b1b; border-color: #fecaca; }
+        .raw-json {
+            margin-top: 8px;
+            font-family: "Consolas", "Monaco", monospace;
+            font-size: 11px;
+            background: #1e293b;
+            color: #94a3b8;
+            padding: 8px 12px;
+            border-radius: 8px;
+            white-space: pre-wrap;
+            max-height: 120px;
+            overflow-y: auto;
+        }
+        .chat-input {
+            padding: 16px 20px;
+            background: white;
+            border-top: 1px solid #e5e5ea;
+            display: flex;
+            gap: 12px;
+        }
+        .chat-input input {
+            flex: 1;
+            padding: 12px 16px;
+            border: 2px solid #e5e5ea;
+            border-radius: 10px;
+            font-size: 15px;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        .chat-input input:focus { border-color: #667eea; }
+        .chat-input button {
+            padding: 12px 24px;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 15px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .chat-input button:hover:not(:disabled) { background: #5568d3; }
+        .chat-input button:disabled { background: #c7c7cf; cursor: not-allowed; }
+        .typing {
+            display: inline-flex;
+            gap: 4px;
+            padding: 12px 16px;
+            background: white;
+            border: 1px solid #e5e5ea;
+            border-radius: 16px;
+            border-bottom-left-radius: 4px;
+        }
+        .typing span {
+            width: 8px; height: 8px;
+            background: #c7c7cf;
+            border-radius: 50%;
+            animation: bounce 1.4s infinite ease-in-out;
+        }
+        .typing span:nth-child(2) { animation-delay: 0.2s; }
+        .typing span:nth-child(3) { animation-delay: 0.4s; }
+        @keyframes bounce {
+            0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
+            40% { transform: scale(1); opacity: 1; }
+        }
+        .hint {
+            padding: 10px 24px;
+            background: #fff7ed;
+            color: #9a3412;
+            font-size: 13px;
+            border-top: 1px solid #fed7aa;
+        }
+        /* 附件暂存区（输入框上方，显示已上传待发送的文件） */
+        .attachments-tray {
+            padding: 8px 20px;
+            background: #f7f7fa;
+            border-top: 1px solid #e5e5ea;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            max-height: 120px;
+            overflow-y: auto;
+        }
+        .attachments-tray:empty { display: none; }
+        .attach-card {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            background: white;
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
+            padding: 6px 10px;
+            font-size: 13px;
+            max-width: 220px;
+        }
+        .attach-card .icon {
+            width: 18px; height: 18px;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 14px;
+        }
+        .attach-card .name {
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            color: #1f2937;
+        }
+        .attach-card .remove {
+            cursor: pointer;
+            color: #9ca3af;
+            font-size: 16px;
+            line-height: 1;
+            padding: 0 2px;
+        }
+        .attach-card .remove:hover { color: #ef4444; }
+        .attach-card.uploading { opacity: 0.6; }
+        .attach-card.uploading .remove { pointer-events: none; }
+        .attach-card.error { border-color: #fecaca; background: #fef2f2; }
+        /* + 按钮 */
+        .plus-btn {
+            width: 42px; height: 42px;
+            border: 2px solid #e5e5ea;
+            background: white;
+            border-radius: 10px;
+            font-size: 22px;
+            color: #667eea;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+            flex-shrink: 0;
+        }
+        .plus-btn:hover { border-color: #667eea; background: #f5f7ff; }
+        .plus-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        /* 用户消息里的附件展示 */
+        .msg-attachments {
+            margin-top: 6px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        .msg-attach-link {
+            font-size: 13px;
+            color: #c7d2fe;
+            text-decoration: none;
+            background: rgba(255,255,255,0.15);
+            padding: 4px 10px;
+            border-radius: 6px;
+            word-break: break-all;
+        }
+        .msg-attach-link:hover { background: rgba(255,255,255,0.25); }
+        /* 顶部"文件列表"按钮 */
+        .files-btn {
+            margin-left: auto;
+            background: rgba(255,255,255,0.18);
+            color: white;
+            border: 1px solid rgba(255,255,255,0.35);
+            border-radius: 8px;
+            padding: 5px 12px;
+            font-size: 13px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .files-btn:hover { background: rgba(255,255,255,0.3); }
+        .header-user { margin-left: auto; font-size: 13px; opacity: 0.9; }
+        #filesBtn { margin-left: 12px; }
+        #logoutBtn { margin-left: 8px; }
+        /* OSS 文件列表面板 */
+        .files-panel {
+            display: none;
+            position: absolute;
+            top: 60px;
+            right: 12px;
+            width: 340px;
+            max-height: 65%;
+            background: white;
+            border: 1px solid #e5e5ea;
+            border-radius: 12px;
+            box-shadow: 0 12px 32px rgba(0,0,0,0.18);
+            z-index: 20;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        .files-panel.open { display: flex; }
+        .files-panel-header {
+            padding: 10px 14px;
+            font-size: 14px;
+            font-weight: 600;
+            color: #1f2937;
+            border-bottom: 1px solid #e5e5ea;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: #f9fafb;
+        }
+        .files-panel-header .refresh {
+            margin-left: auto;
+            border: none;
+            background: #eef2ff;
+            color: #4f46e5;
+            border-radius: 6px;
+            padding: 3px 10px;
+            font-size: 12px;
+            cursor: pointer;
+        }
+        .files-panel-header .refresh:hover { background: #e0e7ff; }
+        .files-list {
+            overflow-y: auto;
+            padding: 6px;
+            flex: 1;
+        }
+        .files-tip {
+            padding: 18px 12px;
+            text-align: center;
+            color: #9ca3af;
+            font-size: 13px;
+        }
+        .file-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 10px;
+            border-radius: 8px;
+            font-size: 13px;
+        }
+        .file-item:hover { background: #f3f4f6; }
+        .file-item .icon { flex-shrink: 0; }
+        .file-item .info {
+            flex: 1;
+            min-width: 0;
+        }
+        .file-item .name {
+            color: #1f2937;
+            text-decoration: none;
+            display: block;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .file-item .name:hover { color: #4f46e5; text-decoration: underline; }
+        .file-item .sub {
+            color: #9ca3af;
+            font-size: 11px;
+            margin-top: 2px;
+        }
+        .file-item .dl {
+            flex-shrink: 0;
+            color: #9ca3af;
+            font-size: 15px;
+            padding: 2px 6px;
+            border-radius: 6px;
+            text-decoration: none;
+        }
+        .file-item .dl:hover { color: #4f46e5; background: #e0e7ff; }
+        .file-item .del {
+            flex-shrink: 0;
+            border: none;
+            background: transparent;
+            color: #9ca3af;
+            font-size: 15px;
+            cursor: pointer;
+            padding: 2px 6px;
+            border-radius: 6px;
+        }
+        .file-item .del:hover { color: #ef4444; background: #fee2e2; }
+    </style>
+</head>
+<body>
+    <div class="chat-container">
+        <div class="chat-header">
+            <span class="dot"></span>
+            <span>DeepSeek 结构化对话</span>
+            <span class="header-user" title="当前登录用户">👤 {{ session.username }}</span>
+            <button class="files-btn" id="filesBtn" title="查看 OSS 上已上传的文件">📁 文件列表</button>
+            <button class="files-btn" id="logoutBtn" title="退出登录">退出</button>
+        </div>
+        <!-- OSS 文件列表面板（默认隐藏，点击右上角按钮展开） -->
+        <div class="files-panel" id="filesPanel">
+            <div class="files-panel-header">
+                <span>OSS 已上传文件</span>
+                <button class="refresh" id="filesRefresh">刷新</button>
+            </div>
+            <div class="files-list" id="filesList">
+                <div class="files-tip">点击"刷新"加载文件...</div>
+            </div>
+        </div>
+        <div class="chat-messages" id="messages">
+            <div class="msg ai">
+                <div class="bubble">你好！我是基于 DeepSeek 的结构化对话助手。每条回复都会附带意图、置信度、关键词等结构化字段。随便问点什么试试吧。</div>
+            </div>
+        </div>
+        <div class="attachments-tray" id="attachTray"></div>
+        <div class="chat-input">
+            <input type="file" id="fileInput" hidden multiple
+                   accept=".jpg,.jpeg,.png,.gif,.webp,.bmp,.pdf,.txt,.md,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.csv">
+            <button class="plus-btn" id="plusBtn" onclick="fileInput.click()" title="上传文件到 OSS">+</button>
+            <input type="text" id="input" placeholder="输入消息后回车发送..." autocomplete="off">
+            <button id="sendBtn" onclick="sendMessage()">发送</button>
+        </div>
+    </div>
+
+    <script>
+        const messagesEl = document.getElementById('messages');
+        const inputEl = document.getElementById('input');
+        const sendBtn = document.getElementById('sendBtn');
+        const fileInput = document.getElementById('fileInput');
+        const attachTray = document.getElementById('attachTray');
+        const plusBtn = document.getElementById('plusBtn');
+
+        // 待发送附件队列：{id, filename, url, size, status}
+        let pendingAttachments = [];
+
+        // 统一请求封装：登录失效（401）时自动跳转登录页
+        async function apiFetch(url, options) {
+            const resp = await fetch(url, options);
+            if (resp.status === 401) {
+                window.location.href = '/login';
+                throw new Error('未登录或登录已过期');
+            }
+            return resp;
+        }
+
+        // 退出登录
+        document.getElementById('logoutBtn').addEventListener('click', async () => {
+            try { await apiFetch('/api/logout', { method: 'POST' }); }
+            catch (e) { /* 无论是否成功都跳登录页 */ }
+            window.location.href = '/login';
+        });
+
+        inputEl.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !sendBtn.disabled) sendMessage();
+        });
+
+        // 文件选择 -> 上传
+        const MAX_SIZE = 10 * 1024 * 1024; // 10MB，与后端一致
+        fileInput.addEventListener('change', async () => {
+            const files = Array.from(fileInput.files || []);
+            fileInput.value = '';
+            for (const f of files) {
+                if (f.size > MAX_SIZE) {
+                    alert(`文件 ${f.name} 超过 10MB，已跳过`);
+                    continue;
+                }
+                await uploadFile(f);
+            }
+        });
+
+        async function uploadFile(file) {
+            const id = 'a' + Date.now() + Math.random().toString(36).slice(2, 6);
+            const card = createAttachCard(id, file.name, file.size, 'uploading');
+            attachTray.appendChild(card);
+            const fd = new FormData();
+            fd.append('file', file, file.name);
+            try {
+                const resp = await apiFetch('/api/upload', { method: 'POST', body: fd });
+                const data = await resp.json();
+                if (!resp.ok || data.error) {
+                    throw new Error(data.error || '上传失败');
+                }
+                pendingAttachments.push({ id, filename: data.filename, url: data.url, size: data.size });
+                markCardDone(id, data.url, false);
+            } catch (err) {
+                markCardError(id, err.message);
+            }
+        }
+
+        function createAttachCard(id, name, size, status) {
+            const card = document.createElement('div');
+            card.className = 'attach-card' + (status === 'uploading' ? ' uploading' : '');
+            card.dataset.id = id;
+            const icon = document.createElement('span');
+            icon.className = 'icon';
+            icon.textContent = status === 'uploading' ? '⏳' : '📄';
+            const nm = document.createElement('span');
+            nm.className = 'name';
+            nm.textContent = name + ' (' + formatSize(size) + ')';
+            const rm = document.createElement('span');
+            rm.className = 'remove';
+            rm.textContent = '×';
+            rm.onclick = () => removeAttachment(id);
+            card.append(icon, nm, rm);
+            return card;
+        }
+
+        function markCardDone(id, url, isError) {
+            const card = attachTray.querySelector(`[data-id="${id}"]`);
+            if (!card) return;
+            card.classList.remove('uploading');
+            card.querySelector('.icon').textContent = '📄';
+        }
+
+        function markCardError(id, msg) {
+            const card = attachTray.querySelector(`[data-id="${id}"]`);
+            if (!card) return;
+            card.classList.add('error');
+            card.classList.remove('uploading');
+            card.querySelector('.icon').textContent = '⚠';
+            card.querySelector('.name').textContent = msg;
+        }
+
+        function removeAttachment(id) {
+            const card = attachTray.querySelector(`[data-id="${id}"]`);
+            if (card) card.remove();
+            pendingAttachments = pendingAttachments.filter(a => a.id !== id);
+        }
+
+        function formatSize(n) {
+            if (n < 1024) return n + 'B';
+            if (n < 1024 * 1024) return (n / 1024).toFixed(1) + 'KB';
+            return (n / 1024 / 1024).toFixed(1) + 'MB';
+        }
+
+        // ======== OSS 文件列表 / 删除 ========
+        const filesBtn = document.getElementById('filesBtn');
+        const filesPanel = document.getElementById('filesPanel');
+        const filesList = document.getElementById('filesList');
+        const filesRefresh = document.getElementById('filesRefresh');
+
+        filesBtn.addEventListener('click', () => {
+            const opening = !filesPanel.classList.contains('open');
+            filesPanel.classList.toggle('open');
+            if (opening) loadFiles();  // 每次展开时自动加载一次
+        });
+        filesRefresh.addEventListener('click', loadFiles);
+
+        async function loadFiles() {
+            filesList.innerHTML = '<div class="files-tip">加载中...</div>';
+            try {
+                const resp = await apiFetch('/api/files');
+                const data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || '加载失败');
+                renderFiles(data.files || []);
+            } catch (err) {
+                filesList.innerHTML = '<div class="files-tip">⚠ ' + err.message + '</div>';
+            }
+        }
+
+        function formatTime(ts) {
+            const d = new Date(ts * 1000);
+            const p = (n) => String(n).padStart(2, '0');
+            return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+        }
+
+        function renderFiles(files) {
+            filesList.innerHTML = '';
+            if (!files.length) {
+                filesList.innerHTML = '<div class="files-tip">暂无文件，点击左下角 + 上传</div>';
+                return;
+            }
+            for (const f of files) {
+                const item = document.createElement('div');
+                item.className = 'file-item';
+
+                const icon = document.createElement('span');
+                icon.className = 'icon';
+                icon.textContent = '📄';
+
+                const info = document.createElement('div');
+                info.className = 'info';
+                const link = document.createElement('a');
+                link.className = 'name';
+                link.href = f.url;
+                link.target = '_blank';
+                link.title = f.object_key;
+                link.textContent = f.filename;
+                const sub = document.createElement('div');
+                sub.className = 'sub';
+                sub.textContent = formatSize(f.size) + ' · ' + formatTime(f.last_modified);
+                info.append(link, sub);
+
+                const dl = document.createElement('a');
+                dl.className = 'dl';
+                dl.href = f.download_url;
+                dl.textContent = '⬇';
+                dl.title = '下载该文件';
+                dl.setAttribute('download', f.filename);  // 提示浏览器存为原始文件名
+
+                const del = document.createElement('button');
+                del.className = 'del';
+                del.textContent = '🗑';
+                del.title = '删除该文件';
+                del.onclick = () => deleteFile(f, item);
+
+                item.append(icon, info, dl, del);
+                filesList.appendChild(item);
+            }
+        }
+
+        async function deleteFile(file, itemEl) {
+            if (!confirm(`确定从 OSS 删除文件 "${file.filename}" 吗？此操作不可恢复。`)) return;
+            const delBtn = itemEl.querySelector('.del');
+            delBtn.disabled = true;
+            delBtn.textContent = '...';
+            try {
+                const resp = await apiFetch('/api/files', {
+                    method: 'DELETE',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ object_key: file.object_key })
+                });
+                const data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || '删除失败');
+                itemEl.remove();  // 从列表中移除
+                if (!filesList.children.length) {
+                    filesList.innerHTML = '<div class="files-tip">暂无文件，点击左下角 + 上传</div>';
+                }
+            } catch (err) {
+                alert('删除失败: ' + err.message);
+                delBtn.disabled = false;
+                delBtn.textContent = '🗑';
+            }
+        }
+
+        function appendUserMsg(text, attachments) {
+            const div = document.createElement('div');
+            div.className = 'msg user';
+            const bubble = document.createElement('div');
+            bubble.className = 'bubble';
+            bubble.textContent = text || '(仅附件)';
+            div.appendChild(bubble);
+            if (attachments && attachments.length) {
+                const wrap = document.createElement('div');
+                wrap.className = 'msg-attachments';
+                for (const a of attachments) {
+                    const link = document.createElement('a');
+                    link.className = 'msg-attach-link';
+                    link.href = a.url;
+                    link.target = '_blank';
+                    link.textContent = '📎 ' + a.filename;
+                    wrap.appendChild(link);
+                }
+                div.appendChild(wrap);
+            }
+            messagesEl.appendChild(div);
+            scrollBottom();
+        }
+
+        function appendAiMsg(data, rawText) {
+            const div = document.createElement('div');
+            div.className = 'msg ai';
+
+            // 主体回复气泡
+            const bubble = document.createElement('div');
+            bubble.className = 'bubble';
+            bubble.textContent = data.reply || '(空回复)';
+            div.appendChild(bubble);
+
+            // 结构化元信息标签
+            const meta = document.createElement('div');
+            meta.className = 'meta';
+            if (data.intent) {
+                const t = document.createElement('span');
+                t.className = 'tag intent';
+                t.textContent = '意图: ' + data.intent;
+                meta.appendChild(t);
+            }
+            if (typeof data.confidence === 'number') {
+                const t = document.createElement('span');
+                t.className = 'tag confidence';
+                t.textContent = '置信度: ' + data.confidence.toFixed(2);
+                meta.appendChild(t);
+            }
+            if (Array.isArray(data.keywords) && data.keywords.length) {
+                const t = document.createElement('span');
+                t.className = 'tag keywords';
+                t.textContent = '关键词: ' + data.keywords.join(', ');
+                meta.appendChild(t);
+            }
+            if (meta.children.length) div.appendChild(meta);
+
+            // 错误标签
+            if (data.error) {
+                const t = document.createElement('span');
+                t.className = 'tag error';
+                t.textContent = '错误: ' + data.error;
+                meta.appendChild(t);
+            }
+
+            // 可折叠的原始 JSON
+            if (rawText) {
+                const raw = document.createElement('div');
+                raw.className = 'raw-json';
+                raw.textContent = rawText;
+                raw.style.cursor = 'pointer';
+                raw.title = '点击折叠/展开';
+                let expanded = true;
+                raw.addEventListener('click', () => {
+                    expanded = !expanded;
+                    raw.style.maxHeight = expanded ? '120px' : '20px';
+                });
+                div.appendChild(raw);
+            }
+
+            messagesEl.appendChild(div);
+            scrollBottom();
+        }
+
+        function appendTyping() {
+            const div = document.createElement('div');
+            div.className = 'msg ai';
+            div.id = 'typing-msg';
+            div.innerHTML = '<div class="typing"><span></span><span></span><span></span></div>';
+            messagesEl.appendChild(div);
+            scrollBottom();
+        }
+        function removeTyping() {
+            const t = document.getElementById('typing-msg');
+            if (t) t.remove();
+        }
+
+        function scrollBottom() {
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+        }
+
+        async function sendMessage() {
+            const text = inputEl.value.trim();
+            // 检查是否有正在上传的附件
+            const uploading = attachTray.querySelector('.attach-card.uploading');
+            if (uploading) { alert('有文件正在上传，请稍候...'); return; }
+            const attachments = pendingAttachments.slice();
+            if (!text && attachments.length === 0) return;
+
+            appendUserMsg(text, attachments);
+            inputEl.value = '';
+            // 清空待发送附件区
+            pendingAttachments = [];
+            attachTray.innerHTML = '';
+            sendBtn.disabled = true;
+            appendTyping();
+
+            try {
+                const resp = await apiFetch('/api/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        message: text,
+                        attachments: attachments.map(a => ({ filename: a.filename, url: a.url, size: a.size }))
+                    })
+                });
+                const data = await resp.json();
+                removeTyping();
+                appendAiMsg(data, JSON.stringify(data, null, 2));
+            } catch (err) {
+                removeTyping();
+                appendAiMsg({ reply: '请求失败', error: err.message }, null);
+            } finally {
+                sendBtn.disabled = false;
+                inputEl.focus();
+            }
+        }
+
+        inputEl.focus();
+    </script>
+</body>
+</html>

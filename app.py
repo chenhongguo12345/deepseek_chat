@@ -1,0 +1,741 @@
+# app.py - Flask 后端：接收用户消息 -> 调用 DeepSeek -> 返回结构化 JSON
+# 启动:  python app.py   然后浏览器打开 http://127.0.0.1:5000
+# 依赖:  pip install -r requirements.txt
+# 配置:  把 DeepSeek API Key 和 阿里云 OSS 凭证填到 .env 文件
+
+import os
+import re
+import json
+import uuid
+import time
+import random
+import threading
+from functools import wraps
+import requests
+import pymysql
+import redis
+from urllib.parse import quote
+from datetime import datetime, timezone, timedelta
+from flask import Flask, request, jsonify, render_template, redirect, session, url_for, g
+from werkzeug.security import generate_password_hash, check_password_hash
+from dotenv import load_dotenv
+
+# 加载 .env 环境变量
+load_dotenv()
+
+app = Flask(__name__, template_folder="templates", static_folder="static")
+# session 加密签名密钥（从 .env 读取，生产环境务必修改）
+app.secret_key = os.getenv("SECRET_KEY", "aichat-dev-secret-key-please-change")
+app.permanent_session_lifetime = timedelta(days=7)
+
+# ======== MySQL 配置（用户登录） ========
+MYSQL_HOST = os.getenv("MYSQL_HOST", "127.0.0.1")
+MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
+MYSQL_USER = os.getenv("MYSQL_USER", "root")
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "123456")
+MYSQL_DB = os.getenv("MYSQL_DB", "aichat")
+
+# ======== Redis 配置（对话上下文缓存） ========
+REDIS_HOST = os.getenv("REDIS_HOST", "127.0.0.1")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "") or None
+REDIS_DB = int(os.getenv("REDIS_DB", "0"))
+CONTEXT_TTL_SECONDS = 3600   # 上下文保留时长：1 小时（每次问答滑动续期）
+CONTEXT_MAX_ROUNDS = 5       # 调用大模型时携带的最近问答轮数
+
+# ======== DeepSeek 配置 ========
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+
+# ======== 对象存储配置（OSS / COS 启动时二选一） ========
+# STORAGE_PROVIDER=oss 强制用阿里云 OSS；=cos 强制用腾讯云 COS；
+# =auto（默认）在两套都配置齐全时随机选一套（负载分担），只配置一套则用那一套。
+# 选定后整个进程固定使用，保证文件列表/删除/下载一致。
+STORAGE_PROVIDER = os.getenv("STORAGE_PROVIDER", "auto").lower()
+
+# 阿里云 OSS
+OSS_ACCESS_KEY_ID = os.getenv("OSS_ACCESS_KEY_ID", "")
+OSS_ACCESS_KEY_SECRET = os.getenv("OSS_ACCESS_KEY_SECRET", "")
+OSS_ENDPOINT = os.getenv("OSS_ENDPOINT", "")         # 例如: oss-cn-hangzhou.aliyuncs.com
+OSS_BUCKET_NAME = os.getenv("OSS_BUCKET_NAME", "")
+OSS_KEY_PREFIX = os.getenv("OSS_KEY_PREFIX", "chat/")  # 上传到 OSS 的目录前缀
+
+# 腾讯云 COS
+COS_SECRET_ID = os.getenv("COS_SECRET_ID", "")
+COS_SECRET_KEY = os.getenv("COS_SECRET_KEY", "")
+COS_REGION = os.getenv("COS_REGION", "")             # 例如: ap-shanghai
+COS_BUCKET_NAME = os.getenv("COS_BUCKET_NAME", "")   # 格式: <BucketName-APPID>
+COS_KEY_PREFIX = os.getenv("COS_KEY_PREFIX", "chat/")
+
+# 允许上传的扩展名（白名单），逗号分隔
+ALLOWED_EXTS = {e.lower() for e in os.getenv(
+    "ALLOWED_EXTS", "jpg,jpeg,png,gif,webp,bmp,pdf,txt,md,doc,docx,xls,xlsx,ppt,pptx,csv"
+).split(",") if e.strip()}
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", str(10 * 1024 * 1024)))  # 默认 10MB
+
+# ======== 操作日志（每周一个文件，文件名为该周周一日期） ========
+# 格式: 2026-09-27 12:00:00 | 127.0.0.1 | UPLOAD | {"filename": "xx", "size": 123}
+LOG_DIR = "logs"
+_log_lock = threading.Lock()
+
+
+def _client_ip():
+    """客户端 IP：部署在 nginx 等反代后时优先取 X-Forwarded-For"""
+    xff = request.headers.get("X-Forwarded-For", "")
+    return xff.split(",")[0].strip() if xff else (request.remote_addr or "unknown")
+
+
+def write_log(action, ip, content):
+    """按周写操作日志：logs/<本周周一日期>.log，跨周自动切换新文件"""
+    try:
+        now = datetime.now()
+        # weekday(): 周一=0 ... 周日=6，减去偏移即得本周周一日期
+        monday = (now - timedelta(days=now.weekday())).strftime("%Y-%m-%d")
+        line = f"{now.strftime('%Y-%m-%d %H:%M:%S')} | {ip} | {action} | {json.dumps(content, ensure_ascii=False)}"
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with _log_lock:
+            with open(os.path.join(LOG_DIR, f"{monday}.log"), "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception as e:
+        print(f"[ERROR] 写日志失败: {e}")
+
+
+def _iso8601_to_ts(s):
+    """COS 返回的 LastModified 是 ISO 8601 字符串（UTC），转成 Unix 秒，与 OSS 口径一致"""
+    try:
+        return int(datetime.strptime(s, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc).timestamp())
+    except Exception:
+        return 0
+
+
+class OssStorage:
+    """阿里云 OSS 封装，对外提供统一的存储接口"""
+    prefix = OSS_KEY_PREFIX
+
+    def __init__(self):
+        import oss2
+        auth = oss2.Auth(OSS_ACCESS_KEY_ID, OSS_ACCESS_KEY_SECRET)
+        self._bucket = oss2.Bucket(auth, OSS_ENDPOINT, OSS_BUCKET_NAME)
+
+    def put_object(self, key, data):
+        self._bucket.put_object(key, data)
+
+    def delete_object(self, key):
+        self._bucket.delete_object(key)
+
+    def sign_url(self, key, expires=3600, params=None):
+        return self._bucket.sign_url("GET", key, expires, params=params)
+
+    def list_objects(self, prefix, marker="", max_keys=100):
+        """返回 (items, is_truncated, next_marker)，item 为统一格式的 dict"""
+        r = self._bucket.list_objects(prefix=prefix, marker=marker, max_keys=max_keys)
+        items = [
+            {"key": o.key, "size": o.size, "last_modified": int(o.last_modified)}
+            for o in r.object_list
+            if not o.key.endswith("/")  # 跳过目录占位符
+        ]
+        return items, r.is_truncated, (r.next_marker if r.is_truncated else "")
+
+
+class CosStorage:
+    """腾讯云 COS 封装，与 OssStorage 保持完全相同的对外接口"""
+    prefix = COS_KEY_PREFIX
+
+    def __init__(self):
+        from qcloud_cos import CosConfig, CosS3Client
+        cfg = CosConfig(Region=COS_REGION, SecretId=COS_SECRET_ID, SecretKey=COS_SECRET_KEY)
+        self._client = CosS3Client(cfg)
+
+    def put_object(self, key, data):
+        self._client.put_object(Bucket=COS_BUCKET_NAME, Body=data, Key=key)
+
+    def delete_object(self, key):
+        self._client.delete_object(Bucket=COS_BUCKET_NAME, Key=key)
+
+    def sign_url(self, key, expires=3600, params=None):
+        kwargs = {"Bucket": COS_BUCKET_NAME, "Key": key, "Expired": expires}
+        if params:
+            kwargs["Params"] = params
+        return self._client.get_presigned_download_url(**kwargs)
+
+    def list_objects(self, prefix, marker="", max_keys=100):
+        kwargs = {"Bucket": COS_BUCKET_NAME, "Prefix": prefix, "MaxKeys": max_keys}
+        if marker:
+            kwargs["Marker"] = marker
+        r = self._client.list_objects(**kwargs)
+        items = [
+            {"key": o["Key"], "size": int(o["Size"]),
+             "last_modified": _iso8601_to_ts(o.get("LastModified", ""))}
+            for o in r.get("Contents", [])
+            if not o["Key"].endswith("/")
+        ]
+        truncated = str(r.get("IsTruncated", "false")).lower() == "true"
+        return items, truncated, (r.get("NextMarker", "") if truncated else "")
+
+
+def _oss_configured():
+    return all([OSS_ACCESS_KEY_ID, OSS_ACCESS_KEY_SECRET, OSS_ENDPOINT, OSS_BUCKET_NAME])
+
+
+def _cos_configured():
+    return all([COS_SECRET_ID, COS_SECRET_KEY, COS_REGION, COS_BUCKET_NAME])
+
+
+# 延迟初始化存储实例：进程内只初始化一次，之后始终使用同一套
+_storage = None
+
+def get_storage():
+    """按 STORAGE_PROVIDER 选择并初始化一套对象存储（OSS 或 COS），不可用返回 None"""
+    global _storage
+    if _storage is not None:
+        return _storage
+
+    provider = STORAGE_PROVIDER
+    if provider == "auto":
+        # auto：收集配置齐全的存储，都齐全时随机选一套实现负载分担
+        candidates = []
+        if _oss_configured():
+            candidates.append("oss")
+        if _cos_configured():
+            candidates.append("cos")
+        provider = random.choice(candidates) if candidates else ""
+
+    if provider == "oss":
+        if not _oss_configured():
+            print("[ERROR] STORAGE_PROVIDER=oss 但 OSS 配置不完整")
+            return None
+        cls = OssStorage
+    elif provider == "cos":
+        if not _cos_configured():
+            print("[ERROR] STORAGE_PROVIDER=cos 但 COS 配置不完整")
+            return None
+        cls = CosStorage
+    else:
+        if provider:
+            print(f"[ERROR] 未知的 STORAGE_PROVIDER: {provider}（可选: oss / cos / auto）")
+        return None
+
+    try:
+        _storage = cls()
+        print(f"[INFO] 对象存储已连接: {provider.upper()}，目录前缀 {cls.prefix}")
+        return _storage
+    except ImportError as e:
+        # 选中的存储 SDK 未安装：如果另一套配置齐全，自动回退到那一套
+        other_provider = "cos" if provider == "oss" else "oss"
+        other_ok = _cos_configured() if other_provider == "cos" else _oss_configured()
+        other_cls = CosStorage if other_provider == "cos" else OssStorage
+        if other_ok:
+            print(f"[WARN] {provider.upper()} SDK 未安装（{e}），自动回退到 {other_provider.upper()}")
+            try:
+                _storage = other_cls()
+                print(f"[INFO] 对象存储已连接（回退）: {other_provider.upper()}，目录前缀 {other_cls.prefix}")
+                return _storage
+            except Exception as e2:
+                print(f"[ERROR] 对象存储初始化失败: {e2}")
+                return None
+        else:
+            print(f"[ERROR] {provider.upper()} SDK 未安装（{e}），且 {other_provider.upper()} 未配置，文件功能不可用。"
+                  f"请执行: pip install {'cos-python-sdk-v5' if provider == 'cos' else 'oss2'}")
+            return None
+    except Exception as e:
+        print(f"[ERROR] 对象存储初始化失败: {e}")
+        return None
+
+
+# 系统提示词：强制模型返回结构化 JSON
+SYSTEM_PROMPT = """你是一个乐于助人的中文对话助手。
+如果用户附带了文件链接，请把链接当作参考资料，但不要在 reply 中原样输出 URL。
+对用户的每一次输入，你必须返回严格的 JSON 对象，字段如下：
+{
+  "reply": "你对用户的回复正文（中文，自然口语化）",
+  "intent": "用户意图的简短分类（如：提问/闲聊/请求/感谢/其他）",
+  "confidence": "你对意图判断的置信度，0 到 1 之间的浮点数",
+  "keywords": ["从用户输入中提取的关键词，最多 3 个"]
+}
+只返回 JSON，不要任何额外文字、不要 markdown 代码块标记。
+"""
+
+
+# ======== MySQL 数据库（用户登录） ========
+def init_db():
+    """启动时调用：自动建库、建 user_account 表；表为空时创建默认管理员 admin/admin123"""
+    # 先不指定数据库连接，以便创建数据库本身
+    conn = pymysql.connect(host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER,
+                           password=MYSQL_PASSWORD, charset="utf8mb4")
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"CREATE DATABASE IF NOT EXISTS `{MYSQL_DB}` "
+                f"DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+            )
+            cur.execute(f"USE `{MYSQL_DB}`")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_account (
+                    username VARCHAR(64) NOT NULL PRIMARY KEY,
+                    valid TINYINT NOT NULL DEFAULT 1,
+                    password VARCHAR(128) NOT NULL,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            with conn.cursor(pymysql.cursors.DictCursor) as dcur:
+                dcur.execute("SELECT COUNT(*) AS c FROM user_account")
+                cnt = dcur.fetchone()["c"]
+            if cnt == 0:
+                cur.execute(
+                    "INSERT INTO user_account (username, valid, password) VALUES (%s, 1, %s)",
+                    ("admin", generate_password_hash("admin123")),
+                )
+                print("[INFO] user_account 表为空，已创建默认管理员: admin / admin123（请尽快登录并修改密码）")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_db():
+    """每个请求复用一个数据库连接，请求结束时由 teardown 关闭"""
+    conn = getattr(g, "_db", None)
+    if conn is None:
+        conn = pymysql.connect(host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER,
+                               password=MYSQL_PASSWORD, database=MYSQL_DB,
+                               charset="utf8mb4",
+                               cursorclass=pymysql.cursors.DictCursor,
+                               autocommit=True)
+        g._db = conn
+    return conn
+
+
+@app.teardown_appcontext
+def _close_db(exc):
+    conn = getattr(g, "_db", None)
+    if conn is not None:
+        conn.close()
+
+
+def verify_password(stored, plain):
+    """兼容两种存储：werkzeug 哈希（pbkdf2/scrypt 前缀）与历史明文密码"""
+    if stored and stored.startswith(("pbkdf2:", "scrypt:")):
+        return check_password_hash(stored, plain)
+    return stored == plain
+
+
+def login_required(view):
+    """登录保护：页面请求未登录跳转 /login；API 请求返回 401 JSON"""
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not session.get("username"):
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "未登录或登录已过期", "login_required": True}), 401
+            return redirect(url_for("login_page"))
+        return view(*args, **kwargs)
+    return wrapped
+
+
+# ======== 登录 / 登出 ========
+@app.route("/login")
+def login_page():
+    if session.get("username"):
+        return redirect(url_for("index"))
+    return render_template("login.html")
+
+
+@app.route("/api/login", methods=["POST"])
+def login():
+    """校验用户名密码 -> 写 session"""
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    if not username or not password:
+        return jsonify({"error": "请输入用户名和密码"}), 400
+
+    try:
+        with get_db().cursor() as cur:
+            cur.execute("SELECT username, password, valid FROM user_account WHERE username = %s", (username,))
+            row = cur.fetchone()
+    except Exception as e:
+        print(f"[ERROR] 数据库查询失败: {e}")
+        return jsonify({"error": "数据库连接失败，请联系管理员"}), 500
+
+    # valid=0 表示账号被停用；密码兼容 werkzeug 哈希和历史明文
+    if not row or not row.get("valid", 1) or not verify_password(row["password"], password):
+        write_log("LOGIN_FAIL", _client_ip(), {"username": username})
+        return jsonify({"error": "用户名或密码错误"}), 401
+
+    session.clear()
+    session.permanent = True
+    session["username"] = row["username"]
+    write_log("LOGIN", _client_ip(), {"username": username})
+    return jsonify({"ok": True, "username": username})
+
+
+@app.route("/api/logout", methods=["POST"])
+def logout():
+    username = session.get("username")
+    session.clear()
+    if username:
+        write_log("LOGOUT", _client_ip(), {"username": username})
+    return jsonify({"ok": True})
+
+
+@app.route("/api/me")
+def me():
+    """供前端获取当前登录用户名"""
+    username = session.get("username")
+    if not username:
+        return jsonify({"login_required": True}), 401
+    return jsonify({"username": username})
+
+
+@app.route("/")
+@login_required
+def index():
+    return render_template("index.html")
+
+
+# ======== 文件上传 ========
+@app.route("/api/upload", methods=["POST"])
+@login_required
+def upload():
+    """接收 multipart 文件 -> 上传到阿里云 OSS -> 返回 {url, filename, size, object_key}"""
+    if "file" not in request.files:
+        return jsonify({"error": "未检测到文件"}), 400
+    file = request.files["file"]
+    if not file.filename:
+        return jsonify({"error": "文件名为空"}), 400
+
+    # 扩展名校验
+    ext = ""
+    if "." in file.filename:
+        ext = file.filename.rsplit(".", 1)[-1].lower()
+    if ext not in ALLOWED_EXTS:
+        return jsonify({"error": f"不支持的文件类型: {ext or '(无扩展名)'}，允许: {','.join(sorted(ALLOWED_EXTS))}"}), 400
+
+    # 读取并校验大小
+    data = file.read()
+    if len(data) > MAX_FILE_SIZE:
+        return jsonify({"error": f"文件过大: {len(data)} 字节，上限 {MAX_FILE_SIZE} 字节"}), 400
+
+    storage = get_storage()
+    if storage is None:
+        return jsonify({"error": "服务器未配置对象存储（请在 .env 中配置 OSS 或 COS 凭证）"}), 500
+
+    # 生成唯一 object key：用户目录 + 时间戳 + uuid + 扩展名
+    safe_name = file.filename.replace("/", "_").replace("\\", "_")
+    object_key = f"{_user_prefix()}{int(time.time())}_{uuid.uuid4().hex[:8]}_{safe_name}"
+
+    try:
+        storage.put_object(object_key, data)
+        # 存储桶通常是私有读写，返回签名 URL（默认 1 小时有效）供前端访问
+        url = storage.sign_url(object_key, 3600)
+    except Exception as e:
+        return jsonify({"error": f"文件上传失败: {str(e)}"}), 502
+
+    write_log("UPLOAD", _client_ip(), {"filename": file.filename, "size": len(data), "object_key": object_key})
+
+    return jsonify({
+        "url": url,
+        "filename": file.filename,
+        "size": len(data),
+        "object_key": object_key,
+    })
+
+
+# ======== OSS 文件列表 / 删除 ========
+# 上传时 object key 形如: chat/zhangsan/1727000000_ab12cd34_报告.pdf（按用户分目录）
+# 该正则用于去掉时间戳和随机串前缀，还原原始文件名用于展示
+
+_KEY_PREFIX_RE = re.compile(r"^\d+_[0-9a-f]{8}_")
+
+
+def _user_prefix():
+    """当前登录用户在对象存储中的目录前缀，如 chat/zhangsan/（隔离各用户的文件）"""
+    return f"{get_storage().prefix}{session['username']}/"
+
+
+@app.route("/api/files", methods=["GET"])
+@login_required
+def list_files():
+    """列出当前登录用户目录下的全部文件（自动分页，只显示 chat/{用户名}/ 内的文件）"""
+    storage = get_storage()
+    if storage is None:
+        return jsonify({"error": "服务器未配置对象存储"}), 500
+
+    up = _user_prefix()
+    try:
+        files = []
+        marker = ""
+        while True:
+            items, truncated, marker = storage.list_objects(prefix=up, marker=marker)
+            for it in items:
+                short_key = it["key"][len(up):] if it["key"].startswith(up) else it["key"]
+                display_name = _KEY_PREFIX_RE.sub("", short_key)
+                files.append({
+                    "object_key": it["key"],
+                    "filename": display_name,
+                    "size": it["size"],
+                    "last_modified": it["last_modified"],
+                    "url": storage.sign_url(it["key"], 3600),
+                    # 下载走服务器代理接口：先记录下载日志，再 302 到存储的强制下载签名 URL
+                    "download_url": f"/api/download?object_key={quote(it['key'])}",
+                })
+            if not truncated:
+                break
+    except Exception as e:
+        return jsonify({"error": f"列出文件失败: {str(e)}"}), 502
+
+    # 新上传的排前面
+    files.sort(key=lambda x: x["last_modified"], reverse=True)
+    return jsonify({"files": files})
+
+
+@app.route("/api/files", methods=["DELETE"])
+@login_required
+def delete_file():
+    """根据 object_key 删除存储上的单个文件（只允许删除当前用户目录内的对象）"""
+    data = request.get_json(silent=True) or {}
+    object_key = (data.get("object_key") or "").strip()
+    if not object_key:
+        return jsonify({"error": "缺少 object_key"}), 400
+
+    storage = get_storage()
+    if storage is None:
+        return jsonify({"error": "服务器未配置对象存储"}), 500
+
+    # 安全校验：防止越权删除本用户目录之外的对象（含其他用户的文件）
+    up = _user_prefix()
+    if object_key == up or not object_key.startswith(up):
+        return jsonify({"error": "非法的 object_key，只能删除自己目录内的文件"}), 403
+    # object key 不允许以 / 结尾（那是目录占位符，不是文件）
+    if object_key.endswith("/"):
+        return jsonify({"error": "非法的 object_key"}), 400
+
+    try:
+        storage.delete_object(object_key)
+    except Exception as e:
+        return jsonify({"error": f"删除失败: {str(e)}"}), 502
+
+    # 还原展示文件名，方便日志阅读
+    short_key = object_key[len(up):] if object_key.startswith(up) else object_key
+    write_log("DELETE", _client_ip(), {"filename": _KEY_PREFIX_RE.sub("", short_key), "object_key": object_key})
+
+    return jsonify({"ok": True, "object_key": object_key})
+
+
+# ======== 文件下载 ========
+@app.route("/api/download")
+@login_required
+def download_file():
+    """下载代理：记录下载日志后 302 重定向到存储的强制下载签名 URL"""
+    object_key = request.args.get("object_key", "").strip()
+    if not object_key:
+        return jsonify({"error": "缺少 object_key"}), 400
+
+    storage = get_storage()
+    if storage is None:
+        return jsonify({"error": "服务器未配置对象存储"}), 500
+
+    # 与删除接口相同的前缀校验，防止越权访问其他用户/目录的对象
+    up = _user_prefix()
+    if object_key == up or not object_key.startswith(up) or object_key.endswith("/"):
+        return jsonify({"error": "非法的 object_key"}), 403
+
+    short_key = object_key[len(up):] if object_key.startswith(up) else object_key
+    display_name = _KEY_PREFIX_RE.sub("", short_key)
+    write_log("DOWNLOAD", _client_ip(), {"filename": display_name, "object_key": object_key})
+
+    # 追加 response-content-disposition 让浏览器强制下载，filename* 形式保证中文名不乱码
+    download_params = {"response-content-disposition": f"attachment; filename*=utf-8''{quote(display_name)}"}
+    # 短有效期（5 分钟）：用户点击后立即使用
+    return redirect(storage.sign_url(object_key, 300, params=download_params), code=302)
+
+
+# ======== Redis 对话上下文（key: context:{用户名}，列表每项为一轮问答 JSON） ========
+_redis_client = None
+_redis_warned = False
+
+
+def get_redis():
+    """获取 Redis 连接（进程内单例）；连接失败返回 None，对话自动降级为无上下文模式"""
+    global _redis_client, _redis_warned
+    if _redis_client is None:
+        try:
+            r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD,
+                            db=REDIS_DB, socket_connect_timeout=1, socket_timeout=1,
+                            decode_responses=True)
+            r.ping()
+            _redis_client = r
+            print(f"[INFO] Redis 已连接: {REDIS_HOST}:{REDIS_PORT}")
+        except Exception as e:
+            if not _redis_warned:
+                print(f"[WARN] Redis 不可用（{e}），多轮上下文功能停用")
+                _redis_warned = True
+            return None
+    return _redis_client
+
+
+def _context_key(username):
+    """上下文在 Redis 中的 key：context:{用户名}"""
+    return f"context:{username}"
+
+
+def load_context_messages(username, max_rounds=CONTEXT_MAX_ROUNDS):
+    """读取用户最近 N 轮问答，展开为 messages 列表（user/assistant 交替）"""
+    r = get_redis()
+    if r is None or not username:
+        return []
+    try:
+        raws = r.lrange(_context_key(username), -max_rounds, -1)
+        msgs = []
+        for raw in raws:
+            try:
+                item = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            if item.get("q"):
+                msgs.append({"role": "user", "content": item["q"]})
+            if item.get("a"):
+                msgs.append({"role": "assistant", "content": item["a"]})
+        return msgs
+    except Exception as e:
+        print(f"[ERROR] 读取对话上下文失败: {e}")
+        return []
+
+
+def save_context_round(username, question, answer):
+    """保存一轮问答；列表只保留最近 CONTEXT_MAX_ROUNDS 轮，1 小时滑动过期"""
+    r = get_redis()
+    if r is None or not username:
+        return
+    try:
+        key = _context_key(username)
+        with r.pipeline() as pipe:
+            pipe.rpush(key, json.dumps({"q": question[:1024], "a": answer[:1024]},
+                                       ensure_ascii=False))
+            pipe.ltrim(key, -CONTEXT_MAX_ROUNDS, -1)
+            pipe.expire(key, CONTEXT_TTL_SECONDS)
+            pipe.execute()
+    except Exception as e:
+        print(f"[ERROR] 保存对话上下文失败: {e}")
+
+
+# ======== DeepSeek 对话 ========
+@app.route("/api/chat", methods=["POST"])
+@login_required
+def chat():
+    """接收 {message: "...", attachments: [{filename, url, size}]} -> 调用 DeepSeek -> 返回结构化 JSON"""
+    data = request.get_json(silent=True) or {}
+    message = (data.get("message") or "").strip()
+    attachments = data.get("attachments") or []
+
+    if not message and not attachments:
+        return jsonify({"error": "消息和附件不能同时为空"}), 400
+
+    if not DEEPSEEK_API_KEY:
+        return jsonify({"error": "服务器未配置 DEEPSEEK_API_KEY，请在 .env 中设置"}), 500
+
+    # 记录用户询问（含附件文件名列表）
+    write_log("CHAT_USER", _client_ip(),
+              {"message": message, "attachments": [a.get("filename", "") for a in attachments]})
+
+    # 用户提问入库：user_question_record 表，record_idx 取该用户当前最大索引 +1（失败不影响对话）
+    record_ref = None  # 成功入库后记为 (username, record_idx)，用于回写 answer
+    if message:
+        username = session["username"]
+        try:
+            with get_db().cursor() as cur:
+                cur.execute(
+                    "SELECT COALESCE(MAX(record_idx), 0) AS max_idx FROM user_question_record WHERE username = %s",
+                    (username,),
+                )
+                next_idx = cur.fetchone()["max_idx"] + 1
+                cur.execute(
+                    "INSERT INTO user_question_record (username, record_idx, time, question) VALUES (%s, %s, %s, %s)",
+                    (username, next_idx,
+                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                     message[:1024]),  # 截断到字段上限 varchar(1024)
+                )
+                record_ref = (username, next_idx)
+        except Exception as e:
+            print(f"[ERROR] 保存用户提问失败: {e}")
+
+    # 组装用户消息：文本 + 附件信息（DeepSeek 不直接读 URL，把附件作为参考信息）
+    user_content = message or ""
+    if attachments:
+        attach_lines = []
+        for a in attachments:
+            attach_lines.append(f"- 文件: {a.get('filename','未知')} ({a.get('size',0)} 字节) 链接: {a.get('url','')}")
+        user_content += "\n\n[附带文件]\n" + "\n".join(attach_lines) + "\n（注意：DeepSeek 无法直接读取文件内容，仅作为信息附带的链接上下文。）"
+
+    # 调用 DeepSeek
+    # 组装 messages：system 提示词 + 用户最近 5 轮历史上下文（Redis） + 当前问题
+    payload_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    payload_messages.extend(load_context_messages(session["username"]))
+    payload_messages.append({"role": "user", "content": user_content})
+    payload = {
+        "model": DEEPSEEK_MODEL,
+        "messages": payload_messages,
+        "response_format": {"type": "json_object"},
+        "temperature": 0.7,
+        "max_tokens": 800,
+    }
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        resp = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=60)
+        resp.raise_for_status()
+    except requests.exceptions.HTTPError:
+        write_log("CHAT_ERROR", _client_ip(), {"message": message, "error": f"DeepSeek API {resp.status_code}"})
+        return jsonify({"error": f"DeepSeek API 调用失败: {resp.status_code} {resp.text[:200]}"}), 502
+    except requests.exceptions.RequestException as e:
+        write_log("CHAT_ERROR", _client_ip(), {"message": message, "error": str(e)[:200]})
+        return jsonify({"error": f"网络请求异常: {str(e)}"}), 502
+
+    try:
+        choice = resp.json()["choices"][0]["message"]["content"]
+        structured = json.loads(choice)
+    except (KeyError, json.JSONDecodeError) as e:
+        write_log("CHAT_ERROR", _client_ip(), {"message": message, "error": f"解析失败: {str(e)}"})
+        return jsonify({"error": f"解析模型返回失败: {str(e)}", "raw": choice if 'choice' in dir() else None}), 502
+
+    # 记录服务器应答
+    write_log("CHAT_AI", _client_ip(),
+              {"reply": structured.get("reply", ""), "intent": structured.get("intent", ""),
+               "confidence": structured.get("confidence"), "keywords": structured.get("keywords", [])})
+
+    # 大模型回答回写到提问记录的 answer 字段（失败不影响返回）
+    if record_ref:
+        try:
+            with get_db().cursor() as cur:
+                cur.execute(
+                    "UPDATE user_question_record SET answer = %s WHERE username = %s AND record_idx = %s",
+                    (structured.get("reply", "")[:1024],  # 截断到字段上限 varchar(1024)
+                     record_ref[0], record_ref[1]),
+                )
+        except Exception as e:
+            print(f"[ERROR] 保存模型回答失败: {e}")
+
+    # 本轮问答存入 Redis 上下文（key=用户名，保留最近 5 轮，1 小时滑动过期）
+    if message:
+        save_context_round(session["username"], message, structured.get("reply", ""))
+
+    structured["user_message"] = message or "(仅附件)"
+    return jsonify(structured)
+
+
+if __name__ == "__main__":
+    if not DEEPSEEK_API_KEY:
+        print("[WARN] 未检测到 DEEPSEEK_API_KEY")
+    # 初始化数据库（自动建库建表、创建默认管理员）
+    try:
+        init_db()
+        print(f"[INFO] MySQL 数据库已就绪: {MYSQL_DB}")
+    except Exception as e:
+        print(f"[ERROR] MySQL 初始化失败: {e}（登录功能不可用，请检查 .env 中 MySQL 配置及数据库服务是否启动）")
+    # 启动时即完成存储选型，之后整个进程都用这一套
+    if get_storage() is None:
+        print("[WARN] 未检测到对象存储配置（OSS 或 COS），文件相关功能不可用")
+    print("[INFO] 服务启动: http://127.0.0.1:5000  (Ctrl+C 退出)")
+    app.run(host="0.0.0.0", port=5000, debug=True)
