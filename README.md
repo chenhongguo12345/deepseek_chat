@@ -35,6 +35,7 @@ python app.py            # 然后浏览器打开 http://127.0.0.1:5000
 | `DEEPSEEK_API_KEY` | 是 | DeepSeek API Key |
 | `DEEPSEEK_MODEL` | 否 | 模型名，默认 `deepseek-chat` |
 | `STORAGE_PROVIDER` | 否 | 对象存储选型：`oss` / `cos` / `auto`（默认 auto，两套都配置时随机选一套，多实例可实现负载分担；只配一套则用那一套）。启动时选定，之后整个进程都用这一套 |
+| `STORAGE_CERT_SEL` | 否 | 存储密钥来源：设为 `db`（小写）时，`OSS_ACCESS_KEY_ID`/`OSS_ACCESS_KEY_SECRET`/`COS_SECRET_ID`/`COS_SECRET_KEY` 四个密钥从 MySQL `certificate` 表读取（`certificatekey` 存键名、`value` 存值），忽略环境变量；默认 `env` 或其他值时沿用环境变量。endpoint/region/bucket 始终取自环境变量 |
 | `OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET` | 二选一 | 阿里云 AccessKey |
 | `OSS_ENDPOINT` | 二选一 | 例如 `oss-cn-hangzhou.aliyuncs.com` |
 | `OSS_BUCKET_NAME` / `OSS_KEY_PREFIX` | 二选一 | Bucket 名称 / 目录前缀（默认 `chat/`） |
@@ -52,14 +53,14 @@ python app.py            # 然后浏览器打开 http://127.0.0.1:5000
 
 > 两套存储都未配置时服务仍可启动，聊天功能正常，仅文件相关功能不可用。
 >
-> **数据库初始化**：启动时 `init_db()` 自动 `CREATE DATABASE IF NOT EXISTS aichat`、`CREATE TABLE IF NOT EXISTS user_account`。表结构为 `username`（主键）、`valid`（1 启用 / 0 停用）、`password`、`created_at`。表为空时自动创建默认管理员 **admin / admin123**（密码以 werkzeug 哈希存储），请登录后尽快修改。已存在的表不会被修改；登录校验兼容历史明文密码和 `pbkdf2:`/`scrypt:` 哈希密码。
+> **数据库初始化**：启动时 `init_db()` 自动 `CREATE DATABASE IF NOT EXISTS aichat`，并创建两张表：`user_account`（`username` 主键、`valid`（1 启用 / 0 停用）、`password`、`created_at`，表为空时自动创建默认管理员 **admin / admin123**，密码 werkzeug 哈希存储，请登录后尽快修改）和 `certificate`（`certificatekey` 主键、`value`、`comment`，`STORAGE_CERT_SEL=db` 时存储 OSS/COS 密钥，插入示例：`INSERT INTO certificate (certificatekey, value) VALUES ('OSS_ACCESS_KEY_ID', 'LTAI...')`，四个键名为 `OSS_ACCESS_KEY_ID`、`OSS_ACCESS_KEY_SECRET`、`COS_SECRET_ID`、`COS_SECRET_KEY`）。已存在的表不会被修改；登录校验兼容历史明文密码和 `pbkdf2:`/`scrypt:` 哈希密码。
 
 ## 存储抽象层（app.py）
 
 为支持 OSS / COS 双存储，所有存储操作收敛到统一接口，业务路由不感知具体厂商：
 
 - **`OssStorage` / `CosStorage`**：两个封装类实现完全相同的接口——`put_object(key, data)`、`delete_object(key)`、`sign_url(key, expires, params)`、`list_objects(prefix, marker)`（返回统一格式的 `(items, is_truncated, next_marker)`，时间统一为 Unix 秒），并各带 `prefix` 属性（上传目录前缀）。COS 的 ISO 8601 时间由 `_iso8601_to_ts()` 转换
-- **`get_storage()`**：按 `STORAGE_PROVIDER` 选型并惰性初始化全局单例，进程内只初始化一次，之后所有请求都用同一套存储
+- **`get_storage()`**：先通过 `_load_storage_certs()` 解析密钥（`STORAGE_CERT_SEL=db` 时从 MySQL `certificate` 表读取，进程内缓存；否则读环境变量），再按 `STORAGE_PROVIDER` 选型并惰性初始化全局单例，进程内只初始化一次，之后所有请求都用同一套存储
 
 ## 后端接口（app.py）
 
