@@ -1,0 +1,6 @@
+git.exe
+*.exe
+.env
+.venv
+.vscode
+__pycache__

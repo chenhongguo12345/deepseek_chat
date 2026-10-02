@@ -53,6 +53,9 @@ DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 # =auto（默认）在两套都配置齐全时随机选一套（负载分担），只配置一套则用那一套。
 # 选定后整个进程固定使用，保证文件列表/删除/下载一致。
 STORAGE_PROVIDER = os.getenv("STORAGE_PROVIDER", "auto").lower()
+# 存储凭证来源：=db（小写）时四个密钥从 MySQL certificate 表读取，忽略环境变量；
+# 其他值（默认 env）沿用环境变量，行为不变
+STORAGE_CERT_SEL = os.getenv("STORAGE_CERT_SEL", "env").strip().lower()
 
 # 阿里云 OSS
 OSS_ACCESS_KEY_ID = os.getenv("OSS_ACCESS_KEY_ID", "")
@@ -109,13 +112,58 @@ def _iso8601_to_ts(s):
         return 0
 
 
+# ======== 存储凭证解析（环境变量 / MySQL certificate 表二选一） ========
+_CERT_KEYS = ("OSS_ACCESS_KEY_ID", "OSS_ACCESS_KEY_SECRET", "COS_SECRET_ID", "COS_SECRET_KEY")
+_db_certs_cache = None
+
+
+def _load_storage_certs():
+    """返回四个存储密钥（dict）。
+    STORAGE_CERT_SEL=db 时从 MySQL certificate 表读取（certificatekey/value），
+    进程内只查一次；否则直接用环境变量，保持原有行为。
+    endpoint/region/bucket 等非密钥配置始终来自环境变量。
+    """
+    global _db_certs_cache
+    if STORAGE_CERT_SEL != "db":
+        return {
+            "OSS_ACCESS_KEY_ID": OSS_ACCESS_KEY_ID,
+            "OSS_ACCESS_KEY_SECRET": OSS_ACCESS_KEY_SECRET,
+            "COS_SECRET_ID": COS_SECRET_ID,
+            "COS_SECRET_KEY": COS_SECRET_KEY,
+        }
+
+    if _db_certs_cache is None:
+        _db_certs_cache = {}
+        try:
+            conn = pymysql.connect(host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER,
+                                   password=MYSQL_PASSWORD, database=MYSQL_DB,
+                                   charset="utf8mb4", connect_timeout=3)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT certificatekey, value FROM certificate "
+                        "WHERE certificatekey IN (%s, %s, %s, %s)",
+                        _CERT_KEYS,
+                    )
+                    for key, value in cur.fetchall():
+                        _db_certs_cache[key] = value or ""
+            finally:
+                conn.close()
+            print(f"[INFO] 存储凭证来源: MySQL {MYSQL_DB}.certificate 表（STORAGE_CERT_SEL=db）")
+        except Exception as e:
+            print(f"[ERROR] 从 MySQL certificate 表读取存储凭证失败: {e}（文件功能将不可用）")
+    return _db_certs_cache
+
+
 class OssStorage:
     """阿里云 OSS 封装，对外提供统一的存储接口"""
     prefix = OSS_KEY_PREFIX
 
-    def __init__(self):
+    def __init__(self, key_id=None, key_secret=None):
         import oss2
-        auth = oss2.Auth(OSS_ACCESS_KEY_ID, OSS_ACCESS_KEY_SECRET)
+        key_id = key_id if key_id is not None else OSS_ACCESS_KEY_ID
+        key_secret = key_secret if key_secret is not None else OSS_ACCESS_KEY_SECRET
+        auth = oss2.Auth(key_id, key_secret)
         self._bucket = oss2.Bucket(auth, OSS_ENDPOINT, OSS_BUCKET_NAME)
 
     def put_object(self, key, data):
@@ -142,9 +190,11 @@ class CosStorage:
     """腾讯云 COS 封装，与 OssStorage 保持完全相同的对外接口"""
     prefix = COS_KEY_PREFIX
 
-    def __init__(self):
+    def __init__(self, secret_id=None, secret_key=None):
         from qcloud_cos import CosConfig, CosS3Client
-        cfg = CosConfig(Region=COS_REGION, SecretId=COS_SECRET_ID, SecretKey=COS_SECRET_KEY)
+        secret_id = secret_id if secret_id is not None else COS_SECRET_ID
+        secret_key = secret_key if secret_key is not None else COS_SECRET_KEY
+        cfg = CosConfig(Region=COS_REGION, SecretId=secret_id, SecretKey=secret_key)
         self._client = CosS3Client(cfg)
 
     def put_object(self, key, data):
@@ -174,12 +224,14 @@ class CosStorage:
         return items, truncated, (r.get("NextMarker", "") if truncated else "")
 
 
-def _oss_configured():
-    return all([OSS_ACCESS_KEY_ID, OSS_ACCESS_KEY_SECRET, OSS_ENDPOINT, OSS_BUCKET_NAME])
+def _oss_configured(certs):
+    return all([certs.get("OSS_ACCESS_KEY_ID"), certs.get("OSS_ACCESS_KEY_SECRET"),
+                OSS_ENDPOINT, OSS_BUCKET_NAME])
 
 
-def _cos_configured():
-    return all([COS_SECRET_ID, COS_SECRET_KEY, COS_REGION, COS_BUCKET_NAME])
+def _cos_configured(certs):
+    return all([certs.get("COS_SECRET_ID"), certs.get("COS_SECRET_KEY"),
+                COS_REGION, COS_BUCKET_NAME])
 
 
 # 延迟初始化存储实例：进程内只初始化一次，之后始终使用同一套
@@ -191,23 +243,26 @@ def get_storage():
     if _storage is not None:
         return _storage
 
+    # 密钥统一从 _load_storage_certs() 取（db 模式来自 MySQL，env 模式来自环境变量）
+    certs = _load_storage_certs()
+
     provider = STORAGE_PROVIDER
     if provider == "auto":
         # auto：收集配置齐全的存储，都齐全时随机选一套实现负载分担
         candidates = []
-        if _oss_configured():
+        if _oss_configured(certs):
             candidates.append("oss")
-        if _cos_configured():
+        if _cos_configured(certs):
             candidates.append("cos")
         provider = random.choice(candidates) if candidates else ""
 
     if provider == "oss":
-        if not _oss_configured():
+        if not _oss_configured(certs):
             print("[ERROR] STORAGE_PROVIDER=oss 但 OSS 配置不完整")
             return None
         cls = OssStorage
     elif provider == "cos":
-        if not _cos_configured():
+        if not _cos_configured(certs):
             print("[ERROR] STORAGE_PROVIDER=cos 但 COS 配置不完整")
             return None
         cls = CosStorage
@@ -217,18 +272,24 @@ def get_storage():
         return None
 
     try:
-        _storage = cls()
+        if provider == "oss":
+            _storage = cls(certs["OSS_ACCESS_KEY_ID"], certs["OSS_ACCESS_KEY_SECRET"])
+        else:
+            _storage = cls(certs["COS_SECRET_ID"], certs["COS_SECRET_KEY"])
         print(f"[INFO] 对象存储已连接: {provider.upper()}，目录前缀 {cls.prefix}")
         return _storage
     except ImportError as e:
         # 选中的存储 SDK 未安装：如果另一套配置齐全，自动回退到那一套
         other_provider = "cos" if provider == "oss" else "oss"
-        other_ok = _cos_configured() if other_provider == "cos" else _oss_configured()
+        other_ok = _cos_configured(certs) if other_provider == "cos" else _oss_configured(certs)
         other_cls = CosStorage if other_provider == "cos" else OssStorage
         if other_ok:
             print(f"[WARN] {provider.upper()} SDK 未安装（{e}），自动回退到 {other_provider.upper()}")
             try:
-                _storage = other_cls()
+                if other_provider == "oss":
+                    _storage = other_cls(certs["OSS_ACCESS_KEY_ID"], certs["OSS_ACCESS_KEY_SECRET"])
+                else:
+                    _storage = other_cls(certs["COS_SECRET_ID"], certs["COS_SECRET_KEY"])
                 print(f"[INFO] 对象存储已连接（回退）: {other_provider.upper()}，目录前缀 {other_cls.prefix}")
                 return _storage
             except Exception as e2:
