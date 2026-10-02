@@ -257,6 +257,7 @@
         .files-btn:hover { background: rgba(255,255,255,0.3); }
         .header-user { margin-left: auto; font-size: 13px; opacity: 0.9; }
         #filesBtn { margin-left: 12px; }
+        #certsBtn { margin-left: 8px; }
         #logoutBtn { margin-left: 8px; }
         /* OSS 文件列表面板 */
         .files-panel {
@@ -365,6 +366,7 @@
             <span>DeepSeek 结构化对话</span>
             <span class="header-user" title="当前登录用户">👤 {{ session.username }}</span>
             <button class="files-btn" id="filesBtn" title="查看 OSS 上已上传的文件">📁 文件列表</button>
+            <button class="files-btn" id="certsBtn" title="管理数据库凭证">🔑 凭证管理</button>
             <button class="files-btn" id="logoutBtn" title="退出登录">退出</button>
         </div>
         <!-- OSS 文件列表面板（默认隐藏，点击右上角按钮展开） -->
@@ -412,6 +414,11 @@
             }
             return resp;
         }
+
+        // 跳转凭证管理页
+        document.getElementById('certsBtn').addEventListener('click', () => {
+            window.location.href = '/certs';
+        });
 
         // 退出登录
         document.getElementById('logoutBtn').addEventListener('click', async () => {

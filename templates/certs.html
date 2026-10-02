@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>凭证管理</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        .container {
+            width: 100%;
+            max-width: 900px;
+            height: 85vh;
+            background: #ffffff;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        .header {
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 18px 24px;
+            font-size: 17px;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .header .dot {
+            width: 10px; height: 10px; border-radius: 50%;
+            background: #4ade80; box-shadow: 0 0 8px #4ade80;
+        }
+        .header-user { margin-left: auto; font-size: 13px; opacity: 0.9; }
+        .nav-btn {
+            background: rgba(255,255,255,0.18);
+            color: white;
+            border: 1px solid rgba(255,255,255,0.35);
+            border-radius: 8px;
+            padding: 5px 12px;
+            font-size: 13px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .nav-btn:hover { background: rgba(255,255,255,0.3); }
+        #backBtn { margin-left: 8px; }
+        .content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 24px;
+            background: #f7f7fa;
+        }
+        .toolbar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+        .toolbar .tip { font-size: 13px; color: #888; }
+        .btn {
+            border: none;
+            border-radius: 8px;
+            padding: 7px 16px;
+            font-size: 13px;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+        .btn:hover { opacity: 0.85; }
+        .btn-primary { background: #667eea; color: white; }
+        .btn-edit { background: #3b82f6; color: white; padding: 4px 10px; }
+        .btn-del { background: #ef4444; color: white; padding: 4px 10px; margin-left: 6px; }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+        }
+        th, td {
+            padding: 12px 14px;
+            text-align: left;
+            font-size: 14px;
+            border-bottom: 1px solid #eee;
+        }
+        th { background: #f0f1f6; color: #555; font-weight: 600; }
+        td.key { font-family: Consolas, monospace; color: #333; }
+        td.val { font-family: Consolas, monospace; color: #888; word-break: break-all; max-width: 260px; }
+        td.comment { color: #777; max-width: 200px; word-break: break-all; }
+        .empty { text-align: center; color: #aaa; padding: 40px 0; font-size: 14px; }
+        /* 弹窗 */
+        .modal-mask {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.45);
+            justify-content: center;
+            align-items: center;
+            z-index: 100;
+        }
+        .modal-mask.show { display: flex; }
+        .modal {
+            background: white;
+            border-radius: 14px;
+            width: 420px;
+            padding: 24px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+        .modal h3 { font-size: 16px; margin-bottom: 18px; color: #333; }
+        .form-row { margin-bottom: 14px; }
+        .form-row label { display: block; font-size: 13px; color: #666; margin-bottom: 6px; }
+        .form-row input, .form-row textarea {
+            width: 100%;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            padding: 9px 12px;
+            font-size: 14px;
+            outline: none;
+            font-family: inherit;
+        }
+        .form-row input:focus, .form-row textarea:focus { border-color: #667eea; }
+        .form-row textarea { resize: vertical; min-height: 60px; }
+        .form-row .err { color: #ef4444; font-size: 12px; margin-top: 4px; min-height: 14px; }
+        .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 8px; }
+        .btn-cancel { background: #e5e7eb; color: #333; }
+        .value-mask { letter-spacing: 2px; color: #aaa; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <span class="dot"></span>
+            <span>🔑 凭证管理（certificate 表）</span>
+            <span class="header-user">👤 {{ session.username }}</span>
+            <button class="nav-btn" id="backBtn">返回聊天</button>
+        </div>
+        <div class="content">
+            <div class="toolbar">
+                <span class="tip">STORAGE_CERT_SEL=db 时，OSS/COS 密钥从此表读取</span>
+                <button class="btn btn-primary" id="addBtn">+ 新增凭证</button>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th style="width:200px">凭证关键字</th>
+                        <th>值</th>
+                        <th>备注</th>
+                        <th style="width:130px">操作</th>
+                    </tr>
+                </thead>
+                <tbody id="certTbody"></tbody>
+            </table>
+            <div class="empty" id="emptyTip" style="display:none">暂无凭证，点击右上角"新增凭证"添加</div>
+        </div>
+    </div>
+
+    <!-- 新增/编辑弹窗 -->
+    <div class="modal-mask" id="modalMask">
+        <div class="modal">
+            <h3 id="modalTitle">新增凭证</h3>
+            <div class="form-row">
+                <label>凭证关键字（certificatekey，主键）</label>
+                <input type="text" id="fKey" maxlength="64" placeholder="如 OSS_ACCESS_KEY_ID">
+                <div class="err" id="errKey"></div>
+            </div>
+            <div class="form-row">
+                <label>值（value）</label>
+                <input type="text" id="fValue" maxlength="128" placeholder="实际的密钥值">
+                <div class="err" id="errValue"></div>
+            </div>
+            <div class="form-row">
+                <label>备注（comment）</label>
+                <textarea id="fComment" maxlength="1024" placeholder="可选"></textarea>
+            </div>
+            <div class="modal-actions">
+                <button class="btn btn-cancel" id="cancelBtn">取消</button>
+                <button class="btn btn-primary" id="saveBtn">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const tbody = document.getElementById('certTbody');
+        const emptyTip = document.getElementById('emptyTip');
+        const modalMask = document.getElementById('modalMask');
+        const modalTitle = document.getElementById('modalTitle');
+        const fKey = document.getElementById('fKey');
+        const fValue = document.getElementById('fValue');
+        const fComment = document.getElementById('fComment');
+        const errKey = document.getElementById('errKey');
+        const errValue = document.getElementById('errValue');
+        let editingKey = null;  // null=新增模式，否则为被编辑的主键
+
+        async function apiFetch(url, options) {
+            const resp = await fetch(url, options);
+            if (resp.status === 401) { window.location.href = '/login'; return resp; }
+            return resp;
+        }
+
+        function escapeHtml(s) {
+            return String(s ?? '').replace(/[&<>"']/g, c =>
+                ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+        }
+
+        async function loadCerts() {
+            const resp = await apiFetch('/api/certs');
+            const data = await resp.json();
+            const certs = data.certs || [];
+            tbody.innerHTML = '';
+            emptyTip.style.display = certs.length ? 'none' : 'block';
+            for (const c of certs) {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td class="key">${escapeHtml(c.certificatekey)}</td>
+                    <td class="val">${escapeHtml(c.value)}</td>
+                    <td class="comment">${escapeHtml(c.comment)}</td>
+                    <td>
+                        <button class="btn btn-edit">编辑</button>
+                        <button class="btn btn-del">删除</button>
+                    </td>`;
+                tr.querySelector('.btn-edit').addEventListener('click', () => openModal(c));
+                tr.querySelector('.btn-del').addEventListener('click', () => delCert(c.certificatekey));
+                tbody.appendChild(tr);
+            }
+        }
+
+        function openModal(cert) {
+            editingKey = cert ? cert.certificatekey : null;
+            modalTitle.textContent = editingKey ? '编辑凭证' : '新增凭证';
+            fKey.value = cert ? cert.certificatekey : '';
+            fKey.disabled = !!editingKey;  // 主键不允许修改
+            fValue.value = cert ? (cert.value || '') : '';
+            fComment.value = cert ? (cert.comment || '') : '';
+            errKey.textContent = '';
+            errValue.textContent = '';
+            modalMask.classList.add('show');
+        }
+
+        function closeModal() { modalMask.classList.remove('show'); }
+
+        async function saveCert() {
+            const key = fKey.value.trim();
+            const value = fValue.value.trim();
+            const comment = fComment.value.trim();
+            errKey.textContent = key ? '' : '关键字不能为空';
+            errValue.textContent = value.length <= 128 ? '' : '值过长（最大 128）';
+            if (!key || value.length > 128) return;
+
+            let resp;
+            if (editingKey) {
+                resp = await apiFetch(`/api/certs/${encodeURIComponent(editingKey)}`, {
+                    method: 'PUT',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({value, comment}),
+                });
+            } else {
+                resp = await apiFetch('/api/certs', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({certificatekey: key, value, comment}),
+                });
+            }
+            const data = await resp.json();
+            if (resp.ok) {
+                closeModal();
+                loadCerts();
+            } else {
+                alert(data.error || '保存失败');
+            }
+        }
+
+        async function delCert(key) {
+            if (!confirm(`确定删除凭证「${key}」吗？\n注意：如果 STORAGE_CERT_SEL=db 且该凭证正在被存储功能使用，删除后相关功能将不可用。`)) return;
+            const resp = await apiFetch(`/api/certs/${encodeURIComponent(key)}`, {method: 'DELETE'});
+            const data = await resp.json();
+            if (resp.ok) loadCerts();
+            else alert(data.error || '删除失败');
+        }
+
+        document.getElementById('addBtn').addEventListener('click', () => openModal(null));
+        document.getElementById('cancelBtn').addEventListener('click', closeModal);
+        document.getElementById('saveBtn').addEventListener('click', saveCert);
+        modalMask.addEventListener('click', (e) => { if (e.target === modalMask) closeModal(); });
+        document.getElementById('backBtn').addEventListener('click', () => { window.location.href = '/'; });
+
+        loadCerts();
+    </script>
+</body>
+</html>

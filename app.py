@@ -453,6 +453,98 @@ def index():
     return render_template("index.html")
 
 
+# ======== 凭证管理（certificate 表 CRUD） ========
+@app.route("/certs")
+@login_required
+def certs_page():
+    """凭证管理页面：增删改查 MySQL certificate 表"""
+    return render_template("certs.html")
+
+
+@app.route("/api/certs", methods=["GET"])
+@login_required
+def certs_list():
+    """列出全部凭证"""
+    try:
+        with get_db().cursor() as cur:
+            cur.execute("SELECT certificatekey, value, comment FROM certificate ORDER BY certificatekey")
+            rows = cur.fetchall()
+    except Exception as e:
+        print(f"[ERROR] 查询凭证失败: {e}")
+        return jsonify({"error": f"查询失败: {str(e)}"}), 500
+    return jsonify({"certs": rows})
+
+
+@app.route("/api/certs", methods=["POST"])
+@login_required
+def cert_create():
+    """新增凭证：{certificatekey, value, comment}"""
+    data = request.get_json(silent=True) or {}
+    key = (data.get("certificatekey") or "").strip()
+    value = (data.get("value") or "").strip()
+    comment = (data.get("comment") or "").strip()
+    if not key:
+        return jsonify({"error": "凭证关键字不能为空"}), 400
+    if len(key) > 64:
+        return jsonify({"error": "关键字过长（最大 64）"}), 400
+    if len(value) > 128:
+        return jsonify({"error": "值过长（最大 128）"}), 400
+    try:
+        with get_db().cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS c FROM certificate WHERE certificatekey = %s", (key,))
+            if cur.fetchone()["c"] > 0:
+                return jsonify({"error": f"关键字 {key} 已存在"}), 409
+            cur.execute(
+                "INSERT INTO certificate (certificatekey, value, comment) VALUES (%s, %s, %s)",
+                (key, value, comment),
+            )
+    except Exception as e:
+        print(f"[ERROR] 新增凭证失败: {e}")
+        return jsonify({"error": f"新增失败: {str(e)}"}), 500
+    write_log("CERT_ADD", _client_ip(), {"username": session["username"], "certificatekey": key})
+    return jsonify({"ok": True})
+
+
+@app.route("/api/certs/<path:key>", methods=["PUT"])
+@login_required
+def cert_update(key):
+    """修改凭证：{value, comment}（按主键 key 定位，关键字本身不允许改）"""
+    data = request.get_json(silent=True) or {}
+    value = (data.get("value") or "").strip()
+    comment = (data.get("comment") or "").strip()
+    if len(value) > 128:
+        return jsonify({"error": "值过长（最大 128）"}), 400
+    try:
+        with get_db().cursor() as cur:
+            cur.execute(
+                "UPDATE certificate SET value = %s, comment = %s WHERE certificatekey = %s",
+                (value, comment, key),
+            )
+            if cur.rowcount == 0:
+                return jsonify({"error": "凭证不存在"}), 404
+    except Exception as e:
+        print(f"[ERROR] 修改凭证失败: {e}")
+        return jsonify({"error": f"修改失败: {str(e)}"}), 500
+    write_log("CERT_EDIT", _client_ip(), {"username": session["username"], "certificatekey": key})
+    return jsonify({"ok": True})
+
+
+@app.route("/api/certs/<path:key>", methods=["DELETE"])
+@login_required
+def cert_delete(key):
+    """删除凭证"""
+    try:
+        with get_db().cursor() as cur:
+            cur.execute("DELETE FROM certificate WHERE certificatekey = %s", (key,))
+            if cur.rowcount == 0:
+                return jsonify({"error": "凭证不存在"}), 404
+    except Exception as e:
+        print(f"[ERROR] 删除凭证失败: {e}")
+        return jsonify({"error": f"删除失败: {str(e)}"}), 500
+    write_log("CERT_DEL", _client_ip(), {"username": session["username"], "certificatekey": key})
+    return jsonify({"ok": True})
+
+
 # ======== 文件上传 ========
 @app.route("/api/upload", methods=["POST"])
 @login_required
