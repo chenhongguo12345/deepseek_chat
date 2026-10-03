@@ -14,6 +14,7 @@
 | 文件下载 | 点击 ⬇ 强制浏览器下载（中文文件名不乱码） |
 | 文件删除 | 点击 🗑 删除 OSS 上的文件（带二次确认，服务端做前缀防越权校验） |
 | 用户登录 | 用户名 + 密码登录（校验 `aichat.user_account` 表，MySQL/PostgreSQL 均可），未登录访问自动跳转登录页；支持登出，会话有效期 7 天 |
+| 用户注册 | 登录页「注册」按钮与登录并列，切换到注册表单输入用户名+密码即可创建账号（密码哈希存储，用户名冲突提示"添加失败"），注册成功后切回登录 |
 | 凭证管理 | 主页「🔑 凭证管理」进入 `/certs` 页面，对 `certificate` 表进行增删改查（新增查重、主键不可改、删除二次确认、操作写日志） |
 | 数据库迁移 | 登录页「将 MySQL 数据导入 PostgreSQL」按钮，自动在 PG 建库建表（库名/表名/字段类型与 MySQL 一致）并全量复制数据 |
 
@@ -59,7 +60,7 @@ python app.py            # 然后浏览器打开 http://127.0.0.1:5000
 
 > 两套存储都未配置时服务仍可启动，聊天功能正常，仅文件相关功能不可用。
 >
-> **数据库初始化**：由 `DATABASE_SEL`（默认 `pgsql`）决定使用 PostgreSQL 还是 MySQL，启动时 `init_db()` 自动建库（两种库均默认 `aichat`）并创建三张表：`user_account`（`username` 主键、`valid`（1 启用 / 0 停用）、`password`，表为空时创建默认管理员 **admin / admin123**，密码 werkzeug 哈希存储）、`certificate`（`certificatekey` 主键、`value`、`comment`，`STORAGE_CERT_SEL=db` 时存储 OSS/COS 密钥，四个键名为 `OSS_ACCESS_KEY_ID`、`OSS_ACCESS_KEY_SECRET`、`COS_SECRET_ID`、`COS_SECRET_KEY`）、`user_question_record`（`username`+`record_idx` 复合主键，存用户问答记录）。MySQL 与 PG 的表名、字段名、类型一一对应（`varchar` 不变、`tinyint`→`smallint`、`int`→`integer`）。已存在的表不会被修改；登录校验兼容历史明文密码和 `pbkdf2:`/`scrypt:` 哈希密码。
+> **数据库初始化**：由 `DATABASE_SEL`（默认 `pgsql`）决定使用 PostgreSQL 还是 MySQL，启动时 `init_db()` 自动建库（两种库均默认 `aichat`）并创建三张表：`user_account`（`username` 主键、`valid`（1 启用 / 0 停用）、`password VARCHAR(255)`，表为空时创建默认管理员 **admin / admin123**，密码 werkzeug 哈希存储）、`certificate`（`certificatekey` 主键、`value`、`comment`，`STORAGE_CERT_SEL=db` 时存储 OSS/COS 密钥，四个键名为 `OSS_ACCESS_KEY_ID`、`OSS_ACCESS_KEY_SECRET`、`COS_SECRET_ID`、`COS_SECRET_KEY`）、`user_question_record`（`username`+`record_idx` 复合主键，存用户问答记录）。MySQL 与 PG 的表名、字段名、类型一一对应（`varchar` 不变、`tinyint`→`smallint`、`int`→`integer`）。`CREATE TABLE IF NOT EXISTS` 不会改动已有表结构，但启动/迁移时会检查 `user_account.password` 列宽，旧表 `varchar(128)` 存不下 werkzeug 3.x 的 scrypt 哈希（约 170+ 字符），会自动 `ALTER` 扩容到 `varchar(255)`（幂等）；登录校验兼容历史明文密码和 `pbkdf2:`/`scrypt:` 哈希密码。
 >
 > **MySQL → PostgreSQL 迁移**：登录页底部按钮调用 `POST /api/migrate/mysql-to-pg`（无需登录，仅供本机运维）。流程：PG 中不存在 `aichat` 库则自动创建 → 读取 MySQL `INFORMATION_SCHEMA` 中三张表的真实结构（列/类型/可空/默认值/主键）生成 PG DDL 并 `CREATE TABLE IF NOT EXISTS` → `TRUNCATE` 目标表后全量复制（重复执行幂等，以 MySQL 当前数据为准，MySQL 数据不改动）。迁移完成后把 `.env` 的 `DATABASE_SEL` 设为 `pgsql` 重启即可。
 
@@ -72,10 +73,13 @@ python app.py            # 然后浏览器打开 http://127.0.0.1:5000
 
 ## 后端接口（app.py）
 
-> 除 `/login`、`/api/login` 外，所有页面和 API 均受 `@login_required` 保护：页面请求未登录 302 跳转 `/login`，API 请求返回 `401 {"login_required": true}`，前端 `apiFetch()` 统一拦截后跳转登录页。
+> 除 `/login`、`/api/login`、`/api/register`、`/api/migrate/mysql-to-pg` 外，所有页面和 API 均受 `@login_required` 保护：页面请求未登录 302 跳转 `/login`，API 请求返回 `401 {"login_required": true}`，前端 `apiFetch()` 统一拦截后跳转登录页。
 
 ### `GET /login` → `login_page()` / `POST /api/login` → `login()`
-登录页渲染 + 登录接口。登录接口按用户名查 `user_account` 表，校验 `valid=1` 且密码匹配（`verify_password()` 兼容哈希/明文），通过后 `session["username"]` 写入签名 Cookie（7 天有效）。另有 `POST /api/logout` 清空会话、`GET /api/me` 返回当前用户。
+登录页渲染 + 登录接口。登录接口按用户名查 `user_account` 表，校验 `valid=1` 且密码匹配（`verify_password()` 兼容哈希/明文），通过后 `session["username"]` 写入签名 Cookie（7 天有效），并生成 `session["sid"]` 用于 Redis 上下文隔离。另有 `POST /api/logout` 清空会话、`GET /api/me` 返回当前用户。
+
+### `POST /api/register` → `register()`
+注册接口（无需登录）。请求体 `{username, password}`，校验用户名 3-64 字符、密码 6-128 字符；先查重，用户名已存在返回 409 `添加失败：用户名「xxx」已存在`（并发主键冲突同样兜底），通过后密码以 werkzeug 哈希（scrypt）写入 `user_account`（`valid=1`），成功返回 `{ok, username}`，注册成功/失败写周日志。
 
 ### `GET /` → `index()`
 登录后渲染聊天页面 `templates/index.html`（头部通过 Jinja2 显示当前 `session.username`）。
@@ -152,12 +156,14 @@ python app.py            # 然后浏览器打开 http://127.0.0.1:5000
 | `LOGIN` | `/api/login` 登录成功 | 用户名 |
 | `LOGIN_FAIL` | 登录失败（用户名/密码错误、账号停用） | 尝试登录的用户名 |
 | `LOGOUT` | `/api/logout` 登出 | 用户名 |
+| `REGISTER` | `/api/register` 注册成功 | 新用户名 |
+| `REGISTER_FAIL` | 注册失败（用户名冲突） | 用户名、失败原因 |
 
 IP 获取：优先取 `X-Forwarded-For` 首个地址（部署在 nginx 反代后时为真实 IP），否则取 `request.remote_addr`。日志写入失败只打印控制台错误，不影响业务接口。
 
 ## 前端（templates/）
 
-- **login.html**：登录页（内联 CSS + 原生 JS，无构建步骤），提交用户名密码到 `/api/login`，失败显示错误提示，成功跳转 `/`；底部「将 MySQL 数据导入 PostgreSQL」按钮调用 `/api/migrate/mysql-to-pg`，显示每表复制行数
+- **login.html**：登录/注册页（内联 CSS + 原生 JS，无构建步骤），「登录」「注册」按钮并列，点击注册在同一卡片切换为注册表单，注册调 `/api/register`（用户名冲突显示添加失败），成功后切回登录；登录提交到 `/api/login`，成功跳转 `/`；底部「将 MySQL 数据导入 PostgreSQL」按钮调用 `/api/migrate/mysql-to-pg`，显示每表复制行数
 - **index.html**：单文件聊天页面，主要模块：
   - **鉴权**：所有业务请求统一走 `apiFetch()`，收到 401 自动跳转 `/login`；头部显示当前用户，「退出」按钮调用 `/api/logout`
   - **聊天**：`sendMessage()` 发送消息+附件到 `/api/chat`，`appendAiMsg()` 渲染回复气泡、意图/置信度/关键词标签和可折叠的原始 JSON

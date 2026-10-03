@@ -339,7 +339,7 @@ _DDL_MYSQL = [
     """CREATE TABLE IF NOT EXISTS user_account (
         username VARCHAR(64) NOT NULL PRIMARY KEY,
         valid TINYINT NOT NULL DEFAULT 1,
-        password VARCHAR(128) NOT NULL
+        password VARCHAR(255) NOT NULL
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
     """CREATE TABLE IF NOT EXISTS certificate (
         certificatekey VARCHAR(64) NOT NULL PRIMARY KEY,
@@ -360,7 +360,7 @@ _DDL_PG = [
     """CREATE TABLE IF NOT EXISTS user_account (
         username VARCHAR(64) NOT NULL PRIMARY KEY,
         valid SMALLINT NOT NULL DEFAULT 1,
-        password VARCHAR(128) NOT NULL
+        password VARCHAR(255) NOT NULL
     )""",
     """CREATE TABLE IF NOT EXISTS certificate (
         certificatekey VARCHAR(64) NOT NULL PRIMARY KEY,
@@ -412,6 +412,33 @@ def db_connect(database=None, backend=None):
     raise ValueError(f"不支持的 DATABASE_SEL: {backend}（可选 mysql / pgsql）")
 
 
+# werkzeug 3.x 默认 scrypt 哈希长度约 170+ 字符，旧表 password varchar(128) 存不下，
+# 启动时检查并扩容到 255（幂等，长度足够则不执行 ALTER）
+_PASSWORD_MIN_LEN = 255
+
+
+def _ensure_password_column(cur, backend, db_name):
+    if backend == "mysql":
+        cur.execute(
+            "SELECT CHARACTER_MAXIMUM_LENGTH AS l FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = 'user_account' AND COLUMN_NAME = 'password'",
+            (db_name,),
+        )
+    else:
+        cur.execute(
+            "SELECT character_maximum_length AS l FROM information_schema.columns "
+            "WHERE table_name = 'user_account' AND column_name = 'password'"
+        )
+    row = cur.fetchone()
+    length = row["l"] if row else None
+    if length is not None and length < _PASSWORD_MIN_LEN:
+        if backend == "mysql":
+            cur.execute(f"ALTER TABLE user_account MODIFY password VARCHAR({_PASSWORD_MIN_LEN}) NOT NULL")
+        else:
+            cur.execute(f"ALTER TABLE user_account ALTER COLUMN password TYPE VARCHAR({_PASSWORD_MIN_LEN})")
+        print(f"[INFO] 已将 user_account.password 列扩容为 VARCHAR({_PASSWORD_MIN_LEN})")
+
+
 def init_db():
     """启动时调用：自动建库建表；user_account 为空时创建默认管理员 admin/admin123"""
     backend = DATABASE_SEL.lower()
@@ -426,6 +453,7 @@ def init_db():
                 cur.execute(f"USE `{MYSQL_DB}`")
                 for ddl in _DDL_MYSQL:
                     cur.execute(ddl)
+                _ensure_password_column(cur, "mysql", MYSQL_DB)
                 cur.execute("SELECT COUNT(*) AS c FROM user_account")
                 cnt = cur.fetchone()["c"]
                 if cnt == 0:
@@ -455,6 +483,7 @@ def init_db():
             with conn.cursor() as cur:
                 for ddl in _DDL_PG:
                     cur.execute(ddl)
+                _ensure_password_column(cur, "pgsql", PG_DB)
                 cur.execute("SELECT COUNT(*) AS c FROM user_account")
                 cnt = cur.fetchone()["c"]
                 if cnt == 0:
@@ -606,6 +635,10 @@ def migrate_mysql_to_pgsql():
                         page_size=500,
                     )
                 report["tables"][table] = len(rows)
+
+            # 迁移后确保 password 列能容纳 werkzeug 哈希（旧表可能是 varchar(128)）
+            if "user_account" in existing:
+                _ensure_password_column(pcur, "pgsql", PG_DB)
     finally:
         my_meta.close()
         my_data.close()
@@ -682,6 +715,46 @@ def login():
     # 同一账号多次登录（或多端登录）各自维护独立的对话上下文
     session["sid"] = uuid.uuid4().hex
     write_log("LOGIN", _client_ip(), {"username": username})
+    return jsonify({"ok": True, "username": username})
+
+
+@app.route("/api/register", methods=["POST"])
+def register():
+    """注册新用户 -> 写入 user_account（密码 werkzeug 哈希存储）；用户名冲突返回 409"""
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    if not username or not password:
+        return jsonify({"error": "请输入用户名和密码"}), 400
+    if not (3 <= len(username) <= 64):
+        return jsonify({"error": "用户名长度需为 3-64 个字符"}), 400
+    if not (6 <= len(password) <= 128):
+        return jsonify({"error": "密码长度需为 6-128 个字符"}), 400
+
+    try:
+        with get_db().cursor() as cur:
+            # 先查重，给用户明确提示
+            cur.execute("SELECT 1 FROM user_account WHERE username = %s", (username,))
+            if cur.fetchone():
+                write_log("REGISTER_FAIL", _client_ip(), {"username": username, "reason": "duplicate"})
+                return jsonify({"error": f"添加失败：用户名「{username}」已存在"}), 409
+            try:
+                cur.execute(
+                    "INSERT INTO user_account (username, valid, password) VALUES (%s, 1, %s)",
+                    (username, generate_password_hash(password)),
+                )
+            except Exception as e:
+                # 并发注册时的主键冲突兜底（MySQL 1062 / PG unique violation）
+                msg = str(e).lower()
+                if "duplicate" in msg or "unique" in msg or "1062" in msg:
+                    write_log("REGISTER_FAIL", _client_ip(), {"username": username, "reason": "duplicate"})
+                    return jsonify({"error": f"添加失败：用户名「{username}」已存在"}), 409
+                raise
+    except Exception as e:
+        print(f"[ERROR] 用户注册失败: {e}")
+        return jsonify({"error": "数据库错误，注册失败，请稍后重试"}), 500
+
+    write_log("REGISTER", _client_ip(), {"username": username})
     return jsonify({"ok": True, "username": username})
 
 

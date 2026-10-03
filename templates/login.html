@@ -54,7 +54,7 @@
             box-shadow: 0 0 0 3px rgba(102,126,234,0.15);
         }
         .login-btn {
-            width: 100%;
+            flex: 1;
             padding: 12px;
             border: none;
             border-radius: 10px;
@@ -64,11 +64,36 @@
             font-weight: 600;
             cursor: pointer;
             transition: opacity 0.2s, transform 0.1s;
-            margin-top: 6px;
         }
         .login-btn:hover { opacity: 0.92; }
         .login-btn:active { transform: scale(0.98); }
         .login-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+        /* 与登录并列的次要按钮（注册 / 返回登录） */
+        .secondary-btn {
+            flex: 1;
+            padding: 12px;
+            border: 1.5px solid #667eea;
+            border-radius: 10px;
+            background: #fff;
+            color: #667eea;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s, transform 0.1s;
+        }
+        .secondary-btn:hover { background: #f0f2ff; }
+        .secondary-btn:active { transform: scale(0.98); }
+        .btn-row { display: flex; gap: 12px; margin-top: 6px; }
+        .success-msg {
+            background: #dcfce7;
+            color: #166534;
+            border-radius: 8px;
+            padding: 10px 14px;
+            font-size: 13px;
+            margin-bottom: 16px;
+            display: none;
+        }
+        .success-msg.show { display: block; }
         .error-msg {
             background: #fee2e2;
             color: #b91c1c;
@@ -118,22 +143,26 @@
     <div class="login-card">
         <div class="login-header">
             <h1><span class="dot"></span>DeepSeek 结构化对话</h1>
-            <p>请登录后使用</p>
+            <p id="subtitle">请登录后使用</p>
         </div>
         <div class="login-body">
+            <div class="success-msg" id="successMsg"></div>
             <div class="error-msg" id="errorMsg"></div>
             <form id="loginForm">
                 <div class="form-group">
                     <label for="username">用户名</label>
                     <input type="text" id="username" name="username" autocomplete="username"
-                           placeholder="请输入用户名" autofocus required>
+                           placeholder="请输入用户名（3-64 个字符）" autofocus required>
                 </div>
                 <div class="form-group">
                     <label for="password">密码</label>
                     <input type="password" id="password" name="password" autocomplete="current-password"
-                           placeholder="请输入密码" required>
+                           placeholder="请输入密码（至少 6 位）" required>
                 </div>
-                <button type="submit" class="login-btn" id="loginBtn">登 录</button>
+                <div class="btn-row">
+                    <button type="submit" class="login-btn" id="submitBtn">登 录</button>
+                    <button type="button" class="secondary-btn" id="switchBtn">注 册</button>
+                </div>
             </form>
             <div class="login-tip">默认管理员 admin / admin123，登录后请及时修改密码</div>
             <div class="migrate-area">
@@ -146,44 +175,91 @@
     <script>
         const form = document.getElementById('loginForm');
         const errorMsg = document.getElementById('errorMsg');
-        const loginBtn = document.getElementById('loginBtn');
+        const successMsg = document.getElementById('successMsg');
+        const submitBtn = document.getElementById('submitBtn');
+        const switchBtn = document.getElementById('switchBtn');
+        const subtitle = document.getElementById('subtitle');
+        const usernameInput = document.getElementById('username');
+        const passwordInput = document.getElementById('password');
+
+        // login = 登录模式（提交登录、并列显示注册按钮）；register = 注册模式（提交注册、并列显示返回登录）
+        let mode = 'login';
 
         function showError(msg) {
+            successMsg.classList.remove('show');
             errorMsg.textContent = msg;
             errorMsg.classList.add('show');
         }
+        function showSuccess(msg) {
+            errorMsg.classList.remove('show');
+            successMsg.textContent = msg;
+            successMsg.classList.add('show');
+        }
+        function hideMsgs() {
+            errorMsg.classList.remove('show');
+            successMsg.classList.remove('show');
+        }
+
+        // 切换登录 / 注册表单
+        function switchMode(target) {
+            mode = target;
+            hideMsgs();
+            passwordInput.value = '';
+            if (mode === 'register') {
+                subtitle.textContent = '注册新账号';
+                submitBtn.textContent = '提交注册';
+                switchBtn.textContent = '返回登录';
+                usernameInput.focus();
+            } else {
+                subtitle.textContent = '请登录后使用';
+                submitBtn.textContent = '登 录';
+                switchBtn.textContent = '注 册';
+                usernameInput.focus();
+            }
+        }
+        switchBtn.addEventListener('click', () => {
+            switchMode(mode === 'login' ? 'register' : 'login');
+        });
 
         form.addEventListener('submit', async (e) => {
             e.preventDefault();
-            errorMsg.classList.remove('show');
-            const username = document.getElementById('username').value.trim();
-            const password = document.getElementById('password').value;
+            hideMsgs();
+            const username = usernameInput.value.trim();
+            const password = passwordInput.value;
             if (!username || !password) {
                 showError('请输入用户名和密码');
                 return;
             }
 
-            loginBtn.disabled = true;
-            loginBtn.textContent = '登录中...';
+            submitBtn.disabled = true;
+            submitBtn.textContent = mode === 'login' ? '登录中...' : '注册中...';
             try {
-                const resp = await fetch('/api/login', {
+                const url = mode === 'login' ? '/api/login' : '/api/register';
+                const resp = await fetch(url, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ username, password })
                 });
                 const data = await resp.json();
                 if (resp.ok && data.ok) {
-                    // 登录成功，跳转主页
-                    window.location.href = '/';
+                    if (mode === 'login') {
+                        // 登录成功，跳转主页
+                        window.location.href = '/';
+                        return;
+                    }
+                    // 注册成功：切回登录模式，预填用户名，等待登录
+                    switchMode('login');
+                    showSuccess(`注册成功！用户「${data.username}」已创建，请使用新账号登录`);
+                    passwordInput.value = '';
                 } else {
-                    showError(data.error || '登录失败');
-                    loginBtn.disabled = false;
-                    loginBtn.textContent = '登 录';
+                    // 注册时用户名冲突等错误：后端返回“添加失败：用户名已存在”
+                    showError(data.error || (mode === 'login' ? '登录失败' : '添加失败'));
                 }
             } catch (err) {
                 showError('网络异常，请稍后重试');
-                loginBtn.disabled = false;
-                loginBtn.textContent = '登 录';
+            } finally {
+                submitBtn.disabled = false;
+                submitBtn.textContent = mode === 'login' ? '登 录' : '提交注册';
             }
         });
 
