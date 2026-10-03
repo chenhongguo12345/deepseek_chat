@@ -4,4 +4,5 @@ python-dotenv>=0.19
 oss2>=2.18
 cos-python-sdk-v5>=1.9
 PyMySQL>=1.1
+psycopg2-binary>=2.9
 redis>=5.0

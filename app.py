@@ -28,12 +28,25 @@ app = Flask(__name__, template_folder="templates", static_folder="static")
 app.secret_key = os.getenv("SECRET_KEY", "aichat-dev-secret-key-please-change")
 app.permanent_session_lifetime = timedelta(days=7)
 
-# ======== MySQL 配置（用户登录） ========
+# ======== 数据库配置（支持 MySQL / PostgreSQL，由 DATABASE_SEL 选择，默认 pgsql） ========
+DATABASE_SEL = os.getenv("DATABASE_SEL", "pgsql").strip().lower()
+
+# MySQL
 MYSQL_HOST = os.getenv("MYSQL_HOST", "127.0.0.1")
 MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
 MYSQL_USER = os.getenv("MYSQL_USER", "root")
 MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "123456")
 MYSQL_DB = os.getenv("MYSQL_DB", "aichat")
+
+# PostgreSQL
+PG_HOST = os.getenv("PG_HOST", "127.0.0.1")
+PG_PORT = int(os.getenv("PG_PORT", "5432"))
+PG_USER = os.getenv("PG_USER", "postgres")
+PG_PASSWORD = os.getenv("PG_PASSWORD", "123456")
+PG_DB = os.getenv("PG_DB", "aichat")
+
+# 迁移时需要复制的表（库名、表名、字段在两种数据库中保持一致）
+MIGRATE_TABLES = ["user_account", "certificate", "user_question_record"]
 
 # ======== Redis 配置（对话上下文缓存） ========
 REDIS_HOST = os.getenv("REDIS_HOST", "127.0.0.1")
@@ -134,10 +147,9 @@ def _load_storage_certs():
 
     if _db_certs_cache is None:
         _db_certs_cache = {}
+        db_name = MYSQL_DB if DATABASE_SEL == "mysql" else PG_DB
         try:
-            conn = pymysql.connect(host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER,
-                                   password=MYSQL_PASSWORD, database=MYSQL_DB,
-                                   charset="utf8mb4", connect_timeout=3)
+            conn = db_connect(database=db_name)
             try:
                 with conn.cursor() as cur:
                     cur.execute(
@@ -145,13 +157,13 @@ def _load_storage_certs():
                         "WHERE certificatekey IN (%s, %s, %s, %s)",
                         _CERT_KEYS,
                     )
-                    for key, value in cur.fetchall():
-                        _db_certs_cache[key] = value or ""
+                    for row in cur.fetchall():
+                        _db_certs_cache[row["certificatekey"]] = row["value"] or ""
             finally:
                 conn.close()
-            print(f"[INFO] 存储凭证来源: MySQL {MYSQL_DB}.certificate 表（STORAGE_CERT_SEL=db）")
+            print(f"[INFO] 存储凭证来源: {DATABASE_SEL} {db_name}.certificate 表（STORAGE_CERT_SEL=db）")
         except Exception as e:
-            print(f"[ERROR] 从 MySQL certificate 表读取存储凭证失败: {e}（文件功能将不可用）")
+            print(f"[ERROR] 从 {DATABASE_SEL} certificate 表读取存储凭证失败: {e}（文件功能将不可用）")
     return _db_certs_cache
 
 
@@ -318,50 +330,150 @@ SYSTEM_PROMPT = """你是一个乐于助人的中文对话助手。
 """
 
 
-# ======== MySQL 数据库（用户登录） ========
+# ======== 数据库适配层（MySQL / PostgreSQL，由 DATABASE_SEL 选择） ========
+# 业务 SQL 全部使用 %s 占位符（pymysql 与 psycopg2 均支持），游标均为字典行，
+# 因此上层路由代码无需感知底层数据库类型。
+
+# 各表建表 DDL（字段名/类型在两种数据库中保持一致，按方言分别声明）
+_DDL_MYSQL = [
+    """CREATE TABLE IF NOT EXISTS user_account (
+        username VARCHAR(64) NOT NULL PRIMARY KEY,
+        valid TINYINT NOT NULL DEFAULT 1,
+        password VARCHAR(128) NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS certificate (
+        certificatekey VARCHAR(64) NOT NULL PRIMARY KEY,
+        value VARCHAR(128) NULL,
+        comment VARCHAR(1024) NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS user_question_record (
+        username VARCHAR(64) NOT NULL,
+        record_idx INT NOT NULL,
+        time VARCHAR(128) NOT NULL,
+        question VARCHAR(1024) NOT NULL,
+        answer VARCHAR(1024) NULL,
+        PRIMARY KEY (username, record_idx)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+]
+
+_DDL_PG = [
+    """CREATE TABLE IF NOT EXISTS user_account (
+        username VARCHAR(64) NOT NULL PRIMARY KEY,
+        valid SMALLINT NOT NULL DEFAULT 1,
+        password VARCHAR(128) NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS certificate (
+        certificatekey VARCHAR(64) NOT NULL PRIMARY KEY,
+        value VARCHAR(128),
+        comment VARCHAR(1024)
+    )""",
+    """CREATE TABLE IF NOT EXISTS user_question_record (
+        username VARCHAR(64) NOT NULL,
+        record_idx INTEGER NOT NULL,
+        time VARCHAR(128) NOT NULL,
+        question VARCHAR(1024) NOT NULL,
+        answer VARCHAR(1024),
+        PRIMARY KEY (username, record_idx)
+    )""",
+]
+
+
+def connect_mysql(database=None, dict_cursor=True):
+    """建立 MySQL 连接；database 为 None 时不指定库（用于建库）"""
+    kwargs = {"host": MYSQL_HOST, "port": MYSQL_PORT, "user": MYSQL_USER,
+              "password": MYSQL_PASSWORD, "charset": "utf8mb4", "autocommit": True}
+    if database:
+        kwargs["database"] = database
+    if dict_cursor:
+        kwargs["cursorclass"] = pymysql.cursors.DictCursor
+    return pymysql.connect(**kwargs)
+
+
+def connect_pg(database=None):
+    """建立 PostgreSQL 连接（默认 RealDictCursor 字典游标，autocommit）"""
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    kwargs = {"host": PG_HOST, "port": PG_PORT, "user": PG_USER,
+              "password": PG_PASSWORD, "cursor_factory": RealDictCursor}
+    if database:
+        kwargs["dbname"] = database
+    conn = psycopg2.connect(**kwargs)
+    conn.autocommit = True
+    return conn
+
+
+def db_connect(database=None, backend=None):
+    """按 DATABASE_SEL（或显式 backend）连接当前数据库；database=None 时连维护库"""
+    backend = (backend or DATABASE_SEL).lower()
+    if backend == "mysql":
+        return connect_mysql(database=database)
+    if backend == "pgsql":
+        return connect_pg(database=database)
+    raise ValueError(f"不支持的 DATABASE_SEL: {backend}（可选 mysql / pgsql）")
+
+
 def init_db():
-    """启动时调用：自动建库、建 user_account 表；表为空时创建默认管理员 admin/admin123"""
-    # 先不指定数据库连接，以便创建数据库本身
-    conn = pymysql.connect(host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER,
-                           password=MYSQL_PASSWORD, charset="utf8mb4")
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"CREATE DATABASE IF NOT EXISTS `{MYSQL_DB}` "
-                f"DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
-            )
-            cur.execute(f"USE `{MYSQL_DB}`")
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS user_account (
-                    username VARCHAR(64) NOT NULL PRIMARY KEY,
-                    valid TINYINT NOT NULL DEFAULT 1,
-                    password VARCHAR(128) NOT NULL,
-                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """)
-            with conn.cursor(pymysql.cursors.DictCursor) as dcur:
-                dcur.execute("SELECT COUNT(*) AS c FROM user_account")
-                cnt = dcur.fetchone()["c"]
-            if cnt == 0:
+    """启动时调用：自动建库建表；user_account 为空时创建默认管理员 admin/admin123"""
+    backend = DATABASE_SEL.lower()
+    if backend == "mysql":
+        conn = connect_mysql(database=None)
+        try:
+            with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO user_account (username, valid, password) VALUES (%s, 1, %s)",
-                    ("admin", generate_password_hash("admin123")),
+                    f"CREATE DATABASE IF NOT EXISTS `{MYSQL_DB}` "
+                    f"DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
                 )
-                print("[INFO] user_account 表为空，已创建默认管理员: admin / admin123（请尽快登录并修改密码）")
-        conn.commit()
-    finally:
-        conn.close()
+                cur.execute(f"USE `{MYSQL_DB}`")
+                for ddl in _DDL_MYSQL:
+                    cur.execute(ddl)
+                cur.execute("SELECT COUNT(*) AS c FROM user_account")
+                cnt = cur.fetchone()["c"]
+                if cnt == 0:
+                    cur.execute(
+                        "INSERT INTO user_account (username, valid, password) VALUES (%s, 1, %s)",
+                        ("admin", generate_password_hash("admin123")),
+                    )
+                    print("[INFO] user_account 表为空，已创建默认管理员: admin / admin123（请尽快登录并修改密码）")
+        finally:
+            conn.close()
+
+    elif backend == "pgsql":
+        # PostgreSQL 的 CREATE DATABASE 不支持 IF NOT EXISTS，先查 pg_database
+        admin_conn = connect_pg(database="postgres")
+        try:
+            with admin_conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (PG_DB,))
+                if cur.fetchone() is None:
+                    # 库名来自服务端配置，非用户输入；PG 不允许对库名使用参数占位符
+                    cur.execute(f'CREATE DATABASE "{PG_DB}"')
+                    print(f"[INFO] PostgreSQL 数据库不存在，已创建: {PG_DB}")
+        finally:
+            admin_conn.close()
+
+        conn = connect_pg(database=PG_DB)
+        try:
+            with conn.cursor() as cur:
+                for ddl in _DDL_PG:
+                    cur.execute(ddl)
+                cur.execute("SELECT COUNT(*) AS c FROM user_account")
+                cnt = cur.fetchone()["c"]
+                if cnt == 0:
+                    cur.execute(
+                        "INSERT INTO user_account (username, valid, password) VALUES (%s, 1, %s)",
+                        ("admin", generate_password_hash("admin123")),
+                    )
+                    print("[INFO] user_account 表为空，已创建默认管理员: admin / admin123（请尽快登录并修改密码）")
+        finally:
+            conn.close()
+    else:
+        raise ValueError(f"不支持的 DATABASE_SEL: {backend}（可选 mysql / pgsql）")
 
 
 def get_db():
     """每个请求复用一个数据库连接，请求结束时由 teardown 关闭"""
     conn = getattr(g, "_db", None)
     if conn is None:
-        conn = pymysql.connect(host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER,
-                               password=MYSQL_PASSWORD, database=MYSQL_DB,
-                               charset="utf8mb4",
-                               cursorclass=pymysql.cursors.DictCursor,
-                               autocommit=True)
+        conn = db_connect(database=MYSQL_DB if DATABASE_SEL == "mysql" else PG_DB)
         g._db = conn
     return conn
 
@@ -371,6 +483,147 @@ def _close_db(exc):
     conn = getattr(g, "_db", None)
     if conn is not None:
         conn.close()
+
+
+# ======== MySQL -> PostgreSQL 一次性数据迁移（登录页按钮触发） ========
+def _mysql_type_to_pg(data_type, length, precision, scale):
+    """按 MySQL INFORMATION_SCHEMA 的类型信息映射为 PostgreSQL 列类型"""
+    t = (data_type or "").lower()
+    if t in ("varchar",):
+        return f"varchar({int(length)})"
+    if t == "char":
+        return f"char({int(length)})"
+    if t == "tinyint":
+        return "smallint"
+    if t in ("smallint", "mediumint", "int", "integer"):
+        return "integer"
+    if t == "bigint":
+        return "bigint"
+    if t in ("datetime", "timestamp"):
+        return "timestamp"
+    if t == "date":
+        return "date"
+    if t == "time":
+        return "time"
+    if t in ("tinytext", "text", "mediumtext", "longtext"):
+        return "text"
+    if t in ("decimal", "numeric"):
+        return f"decimal({int(precision)},{int(scale or 0)})"
+    if t == "float":
+        return "real"
+    if t in ("double",):
+        return "double precision"
+    return "text"  # 未知类型兜底为 text，避免迁移中断
+
+
+def migrate_mysql_to_pgsql():
+    """把 MySQL 数据完整复制到 PostgreSQL：
+    1) PG 中不存在目标库则自动创建（库名同 MySQL，默认 aichat）；
+    2) 按 MySQL 实际表结构（字段名/类型/可空/默认值/主键）在 PG 建同名表；
+    3) 清空目标表后全量复制数据。返回每张表复制行数的报告。
+    """
+    from psycopg2.extras import execute_values
+
+    # 1. 确保 PG 目标数据库存在
+    database_created = False
+    admin_conn = connect_pg(database="postgres")
+    try:
+        with admin_conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (PG_DB,))
+            if cur.fetchone() is None:
+                cur.execute(f'CREATE DATABASE "{PG_DB}"')
+                database_created = True
+    finally:
+        admin_conn.close()
+
+    # 2. 读 MySQL 表结构 -> PG 建表 -> 复制数据
+    my_meta = connect_mysql(database=MYSQL_DB)              # 字典游标：读元数据
+    my_data = connect_mysql(database=MYSQL_DB, dict_cursor=False)  # 元组游标：读数据
+    pg = connect_pg(database=PG_DB)
+    report = {"database_created": database_created, "tables": {}}
+    try:
+        with my_meta.cursor() as mcur, my_data.cursor() as dcur, pg.cursor() as pcur:
+            # 只迁移 MIGRATE_TABLES 中实际存在的表
+            mcur.execute(
+                "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
+                "WHERE TABLE_SCHEMA = %s AND TABLE_NAME IN (%s, %s, %s)",
+                (MYSQL_DB, *MIGRATE_TABLES),
+            )
+            existing = [r["TABLE_NAME"] for r in mcur.fetchall()]
+
+            for table in existing:
+                # 列信息
+                mcur.execute(
+                    """SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH,
+                              NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE, COLUMN_DEFAULT
+                       FROM INFORMATION_SCHEMA.COLUMNS
+                       WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+                       ORDER BY ORDINAL_POSITION""",
+                    (MYSQL_DB, table),
+                )
+                columns = mcur.fetchall()
+                # 主键列
+                mcur.execute(
+                    """SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+                       WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND CONSTRAINT_NAME = 'PRIMARY'
+                       ORDER BY ORDINAL_POSITION""",
+                    (MYSQL_DB, table),
+                )
+                pk_cols = [r["COLUMN_NAME"] for r in mcur.fetchall()]
+
+                col_defs = []
+                for c in columns:
+                    pg_type = _mysql_type_to_pg(c["DATA_TYPE"], c["CHARACTER_MAXIMUM_LENGTH"],
+                                                c["NUMERIC_PRECISION"], c["NUMERIC_SCALE"])
+                    d = f'"{c["COLUMN_NAME"]}" {pg_type}'
+                    d += "" if c["IS_NULLABLE"] == "YES" else " NOT NULL"
+                    default = c["COLUMN_DEFAULT"]
+                    if default is not None:
+                        if str(default).upper() == "CURRENT_TIMESTAMP":
+                            d += " DEFAULT CURRENT_TIMESTAMP"
+                        elif str(default).lstrip("-").isdigit():
+                            d += f" DEFAULT {default}"
+                        else:
+                            d += " DEFAULT '" + str(default).replace("'", "''") + "'"
+                    col_defs.append(d)
+                if pk_cols:
+                    col_defs.append("PRIMARY KEY (" + ", ".join(f'"{c}"' for c in pk_cols) + ")")
+
+                create_sql = f'CREATE TABLE IF NOT EXISTS "{table}" (\n  ' + ",\n  ".join(col_defs) + "\n)"
+                pcur.execute(create_sql)
+
+                # 清空目标表后全量复制（表间无外键，可直接 TRUNCATE）
+                pcur.execute(f'TRUNCATE TABLE "{table}"')
+                dcur.execute(f"SELECT * FROM `{table}`")
+                col_names = [desc[0] for desc in dcur.description]
+                rows = dcur.fetchall()
+                if rows:
+                    cols_sql = ", ".join(f'"{c}"' for c in col_names)
+                    execute_values(
+                        pcur,
+                        f'INSERT INTO "{table}" ({cols_sql}) VALUES %s',
+                        rows,
+                        page_size=500,
+                    )
+                report["tables"][table] = len(rows)
+    finally:
+        my_meta.close()
+        my_data.close()
+        pg.close()
+    return report
+
+
+@app.route("/api/migrate/mysql-to-pg", methods=["POST"])
+def migrate_to_pg():
+    """登录页触发：把 MySQL 数据导入 PostgreSQL（无需登录，仅限本机运维使用）"""
+    try:
+        report = migrate_mysql_to_pgsql()
+    except Exception as e:
+        print(f"[ERROR] MySQL -> PostgreSQL 迁移失败: {e}")
+        write_log("DB_MIGRATE_FAIL", _client_ip(), {"error": str(e)})
+        return jsonify({"error": f"迁移失败: {str(e)}"}), 500
+    write_log("DB_MIGRATE", _client_ip(), report)
+    return jsonify({"ok": True, "report": report})
 
 
 def verify_password(stored, plain):
@@ -425,6 +678,9 @@ def login():
     session.clear()
     session.permanent = True
     session["username"] = row["username"]
+    # 每次登录生成独立的会话 ID：Redis 上下文按 用户名+sessionid 隔离，
+    # 同一账号多次登录（或多端登录）各自维护独立的对话上下文
+    session["sid"] = uuid.uuid4().hex
     write_log("LOGIN", _client_ip(), {"username": username})
     return jsonify({"ok": True, "username": username})
 
@@ -727,8 +983,12 @@ def get_redis():
 
 
 def _context_key(username):
-    """上下文在 Redis 中的 key：context:{用户名}"""
-    return f"context:{username}"
+    """上下文在 Redis 中的 key：context:{用户名}:{sessionid}。
+    不同登录会话使用不同 sid，上下文只在本会话内可见；
+    sid 缺失时（理论上不会发生，登录时必写）退化为仅用户名的 key。
+    """
+    sid = session.get("sid") or ""
+    return f"context:{username}:{sid}" if sid else f"context:{username}"
 
 
 def load_context_messages(username, max_rounds=CONTEXT_MAX_ROUNDS):
@@ -884,9 +1144,11 @@ if __name__ == "__main__":
     # 初始化数据库（自动建库建表、创建默认管理员）
     try:
         init_db()
-        print(f"[INFO] MySQL 数据库已就绪: {MYSQL_DB}")
+        active_db_name = MYSQL_DB if DATABASE_SEL == "mysql" else PG_DB
+        print(f"[INFO] 数据库已就绪: {DATABASE_SEL.upper()} {active_db_name}")
     except Exception as e:
-        print(f"[ERROR] MySQL 初始化失败: {e}（登录功能不可用，请检查 .env 中 MySQL 配置及数据库服务是否启动）")
+        print(f"[ERROR] {DATABASE_SEL.upper()} 初始化失败: {e}"
+              f"（登录功能不可用，请检查 .env 中 {DATABASE_SEL.upper()} 配置及数据库服务是否启动）")
     # 启动时即完成存储选型，之后整个进程都用这一套
     if get_storage() is None:
         print("[WARN] 未检测到对象存储配置（OSS 或 COS），文件相关功能不可用")

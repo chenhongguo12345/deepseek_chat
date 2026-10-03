@@ -83,6 +83,35 @@
             text-align: center; font-size: 12px; color: #999;
             margin-top: 16px;
         }
+        .migrate-area {
+            margin-top: 18px;
+            padding-top: 16px;
+            border-top: 1px dashed #e2e5ee;
+            text-align: center;
+        }
+        .migrate-btn {
+            background: #fff;
+            color: #667eea;
+            border: 1.5px solid #667eea;
+            border-radius: 8px;
+            padding: 7px 14px;
+            font-size: 13px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .migrate-btn:hover { background: #f0f2ff; }
+        .migrate-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+        .migrate-result {
+            display: none;
+            margin-top: 10px;
+            font-size: 12px;
+            border-radius: 8px;
+            padding: 9px 12px;
+            text-align: left;
+            line-height: 1.6;
+        }
+        .migrate-result.ok { display: block; background: #dcfce7; color: #166534; }
+        .migrate-result.fail { display: block; background: #fee2e2; color: #b91c1c; }
     </style>
 </head>
 <body>
@@ -107,6 +136,10 @@
                 <button type="submit" class="login-btn" id="loginBtn">登 录</button>
             </form>
             <div class="login-tip">默认管理员 admin / admin123，登录后请及时修改密码</div>
+            <div class="migrate-area">
+                <button type="button" class="migrate-btn" id="migrateBtn">将 MySQL 数据导入 PostgreSQL</button>
+                <div class="migrate-result" id="migrateResult"></div>
+            </div>
         </div>
     </div>
 
@@ -151,6 +184,42 @@
                 showError('网络异常，请稍后重试');
                 loginBtn.disabled = false;
                 loginBtn.textContent = '登 录';
+            }
+        });
+
+        // MySQL -> PostgreSQL 数据迁移（会清空 PG 目标表后全量复制，需要二次确认）
+        const migrateBtn = document.getElementById('migrateBtn');
+        const migrateResult = document.getElementById('migrateResult');
+        migrateBtn.addEventListener('click', async () => {
+            if (!confirm('确定把 MySQL 的数据导入 PostgreSQL 吗？\n\n'
+                + '· PostgreSQL 中不存在的数据库和表会自动创建（库名/表名/字段与 MySQL 一致）\n'
+                + '· 已存在的目标表会被【清空】后全量复制 MySQL 当前数据\n'
+                + '· MySQL 数据不会被修改')) return;
+            migrateBtn.disabled = true;
+            migrateBtn.textContent = '迁移中...';
+            migrateResult.className = 'migrate-result';
+            migrateResult.textContent = '';
+            try {
+                const resp = await fetch('/api/migrate/mysql-to-pg', { method: 'POST' });
+                const data = await resp.json();
+                if (resp.ok && data.ok) {
+                    const r = data.report;
+                    const lines = Object.entries(r.tables)
+                        .map(([t, n]) => `· ${t}：${n} 行`).join('<br>');
+                    migrateResult.className = 'migrate-result ok';
+                    migrateResult.innerHTML =
+                        `迁移成功${r.database_created ? '（已新建数据库）' : ''}：<br>${lines}`
+                        + '<br>之后请将 .env 中 DATABASE_SEL 设为 pgsql 并重启服务。';
+                } else {
+                    migrateResult.className = 'migrate-result fail';
+                    migrateResult.textContent = data.error || '迁移失败';
+                }
+            } catch (err) {
+                migrateResult.className = 'migrate-result fail';
+                migrateResult.textContent = '网络异常，迁移失败';
+            } finally {
+                migrateBtn.disabled = false;
+                migrateBtn.textContent = '将 MySQL 数据导入 PostgreSQL';
             }
         });
     </script>

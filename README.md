@@ -13,8 +13,9 @@
 | 文件预览 | 点击文件名在新标签页打开（1 小时有效的签名 URL） |
 | 文件下载 | 点击 ⬇ 强制浏览器下载（中文文件名不乱码） |
 | 文件删除 | 点击 🗑 删除 OSS 上的文件（带二次确认，服务端做前缀防越权校验） |
-| 用户登录 | 用户名 + 密码登录（校验 MySQL `aichat.user_account` 表），未登录访问自动跳转登录页；支持登出，会话有效期 7 天 |
+| 用户登录 | 用户名 + 密码登录（校验 `aichat.user_account` 表，MySQL/PostgreSQL 均可），未登录访问自动跳转登录页；支持登出，会话有效期 7 天 |
 | 凭证管理 | 主页「🔑 凭证管理」进入 `/certs` 页面，对 `certificate` 表进行增删改查（新增查重、主键不可改、删除二次确认、操作写日志） |
+| 数据库迁移 | 登录页「将 MySQL 数据导入 PostgreSQL」按钮，自动在 PG 建库建表（库名/表名/字段类型与 MySQL 一致）并全量复制数据 |
 
 ## 快速开始
 
@@ -45,16 +46,22 @@ python app.py            # 然后浏览器打开 http://127.0.0.1:5000
 | `COS_BUCKET_NAME` / `COS_KEY_PREFIX` | 二选一 | Bucket 名称（格式 `<名>-<APPID>`）/ 目录前缀（默认 `chat/`） |
 | `ALLOWED_EXTS` | 否 | 允许上传的扩展名白名单，逗号分隔 |
 | `MAX_FILE_SIZE` | 否 | 单文件大小上限（字节），默认 10MB |
-| `MYSQL_HOST` / `MYSQL_PORT` | 是 | MySQL 地址 / 端口，默认 `127.0.0.1` / `3306` |
-| `MYSQL_USER` / `MYSQL_PASSWORD` | 是 | 数据库账号 / 密码，默认 `root` / `123456` |
-| `MYSQL_DB` | 是 | 数据库名，默认 `aichat`（不存在时启动自动创建） |
+| `DATABASE_SEL` | 否 | 数据库类型：`pgsql`（默认，PostgreSQL）/ `mysql`；登录、凭证、问答记录全部按此选择数据库 |
+| `MYSQL_HOST` / `MYSQL_PORT` | mysql 模式 | MySQL 地址 / 端口，默认 `127.0.0.1` / `3306` |
+| `MYSQL_USER` / `MYSQL_PASSWORD` | mysql 模式 | 数据库账号 / 密码，默认 `root` / `123456` |
+| `MYSQL_DB` | mysql 模式 | 数据库名，默认 `aichat`（不存在时启动自动创建） |
+| `PG_HOST` / `PG_PORT` | pgsql 模式 | PostgreSQL 地址 / 端口，默认 `127.0.0.1` / `5432` |
+| `PG_USER` / `PG_PASSWORD` | pgsql 模式 | 数据库账号 / 密码，默认 `postgres` / `123456` |
+| `PG_DB` | pgsql 模式 | 数据库名，默认 `aichat`（不存在时启动自动创建，也可由登录页迁移按钮创建） |
 | `REDIS_HOST` / `REDIS_PORT` | 否 | Redis 地址 / 端口，默认 `127.0.0.1` / `6379`；Redis 不可用时自动降级为无上下文模式 |
 | `REDIS_PASSWORD` / `REDIS_DB` | 否 | Redis 密码（无密码留空不填）/ 库编号，默认 0 |
 | `SECRET_KEY` | 否 | session Cookie 签名密钥，生产环境务必改成随机长字符串 |
 
 > 两套存储都未配置时服务仍可启动，聊天功能正常，仅文件相关功能不可用。
 >
-> **数据库初始化**：启动时 `init_db()` 自动 `CREATE DATABASE IF NOT EXISTS aichat`，并创建两张表：`user_account`（`username` 主键、`valid`（1 启用 / 0 停用）、`password`、`created_at`，表为空时自动创建默认管理员 **admin / admin123**，密码 werkzeug 哈希存储，请登录后尽快修改）和 `certificate`（`certificatekey` 主键、`value`、`comment`，`STORAGE_CERT_SEL=db` 时存储 OSS/COS 密钥，插入示例：`INSERT INTO certificate (certificatekey, value) VALUES ('OSS_ACCESS_KEY_ID', 'LTAI...')`，四个键名为 `OSS_ACCESS_KEY_ID`、`OSS_ACCESS_KEY_SECRET`、`COS_SECRET_ID`、`COS_SECRET_KEY`）。已存在的表不会被修改；登录校验兼容历史明文密码和 `pbkdf2:`/`scrypt:` 哈希密码。
+> **数据库初始化**：由 `DATABASE_SEL`（默认 `pgsql`）决定使用 PostgreSQL 还是 MySQL，启动时 `init_db()` 自动建库（两种库均默认 `aichat`）并创建三张表：`user_account`（`username` 主键、`valid`（1 启用 / 0 停用）、`password`，表为空时创建默认管理员 **admin / admin123**，密码 werkzeug 哈希存储）、`certificate`（`certificatekey` 主键、`value`、`comment`，`STORAGE_CERT_SEL=db` 时存储 OSS/COS 密钥，四个键名为 `OSS_ACCESS_KEY_ID`、`OSS_ACCESS_KEY_SECRET`、`COS_SECRET_ID`、`COS_SECRET_KEY`）、`user_question_record`（`username`+`record_idx` 复合主键，存用户问答记录）。MySQL 与 PG 的表名、字段名、类型一一对应（`varchar` 不变、`tinyint`→`smallint`、`int`→`integer`）。已存在的表不会被修改；登录校验兼容历史明文密码和 `pbkdf2:`/`scrypt:` 哈希密码。
+>
+> **MySQL → PostgreSQL 迁移**：登录页底部按钮调用 `POST /api/migrate/mysql-to-pg`（无需登录，仅供本机运维）。流程：PG 中不存在 `aichat` 库则自动创建 → 读取 MySQL `INFORMATION_SCHEMA` 中三张表的真实结构（列/类型/可空/默认值/主键）生成 PG DDL 并 `CREATE TABLE IF NOT EXISTS` → `TRUNCATE` 目标表后全量复制（重复执行幂等，以 MySQL 当前数据为准，MySQL 数据不改动）。迁移完成后把 `.env` 的 `DATABASE_SEL` 设为 `pgsql` 重启即可。
 
 ## 存储抽象层（app.py）
 
@@ -107,7 +114,7 @@ python app.py            # 然后浏览器打开 http://127.0.0.1:5000
 ### `POST /api/chat` → `chat()`
 请求体：`{"message": "...", "attachments": [{filename, url, size}]}`（两者不能同时为空）。
 
-处理流程：**用户提问入库**（`user_question_record` 表，`record_idx` 取该用户当前 `MAX(record_idx)+1`，时间格式 `YYYY-MM-DD HH:MM:SS`，超长问题截断到 1024 字符，入库失败只打印错误不影响对话）→ 组装用户消息（文本 + 附件信息列表）→ **携带上下文调用** DeepSeek（messages = system 提示词 + Redis 中该用户最近 5 轮问答 + 当前问题；`response_format: json_object` 强制 JSON 输出）→ 解析模型返回的 JSON → **回答回写**（`UPDATE` 该记录的 `answer` 字段，同样截断 1024 字符；DeepSeek 调用失败时 answer 留空）→ **本轮问答写入 Redis 上下文**（key `context:{用户名}`，保留最近 5 轮，1 小时滑动过期）→ 附加 `user_message` 字段后返回。
+处理流程：**用户提问入库**（`user_question_record` 表，`record_idx` 取该用户当前 `MAX(record_idx)+1`，时间格式 `YYYY-MM-DD HH:MM:SS`，超长问题截断到 1024 字符，入库失败只打印错误不影响对话）→ 组装用户消息（文本 + 附件信息列表）→ **携带上下文调用** DeepSeek（messages = system 提示词 + Redis 中**当前会话**最近 5 轮问答 + 当前问题；`response_format: json_object` 强制 JSON 输出）→ 解析模型返回的 JSON → **回答回写**（`UPDATE` 该记录的 `answer` 字段，同样截断 1024 字符；DeepSeek 调用失败时 answer 留空）→ **本轮问答写入 Redis 上下文**（key `context:{用户名}:{sessionid}`，登录时生成独立 sid，同账号多次登录/多端登录上下文互不影响；保留最近 5 轮，1 小时滑动过期）→ 附加 `user_message` 字段后返回。
 
 返回结构：
 
@@ -150,7 +157,7 @@ IP 获取：优先取 `X-Forwarded-For` 首个地址（部署在 nginx 反代后
 
 ## 前端（templates/）
 
-- **login.html**：登录页（内联 CSS + 原生 JS，无构建步骤），提交用户名密码到 `/api/login`，失败显示错误提示，成功跳转 `/`
+- **login.html**：登录页（内联 CSS + 原生 JS，无构建步骤），提交用户名密码到 `/api/login`，失败显示错误提示，成功跳转 `/`；底部「将 MySQL 数据导入 PostgreSQL」按钮调用 `/api/migrate/mysql-to-pg`，显示每表复制行数
 - **index.html**：单文件聊天页面，主要模块：
   - **鉴权**：所有业务请求统一走 `apiFetch()`，收到 401 自动跳转 `/login`；头部显示当前用户，「退出」按钮调用 `/api/logout`
   - **聊天**：`sendMessage()` 发送消息+附件到 `/api/chat`，`appendAiMsg()` 渲染回复气泡、意图/置信度/关键词标签和可折叠的原始 JSON
@@ -159,9 +166,9 @@ IP 获取：优先取 `X-Forwarded-For` 首个地址（部署在 nginx 反代后
 
 ## 运行环境说明
 
-- 需要 Python 3.9+，依赖见 `requirements.txt`（Flask / requests / python-dotenv / oss2 / cos-python-sdk-v5 / PyMySQL / redis）
-- 需要可访问的 MySQL 服务（账号密码库名在 `.env` 配置），启动时自动建库建表
-- 可选：本地 Redis 服务（对话上下文缓存，`context:{用户名}` 键保留最近 5 轮问答、1 小时滑动过期；未启动时自动降级，不影响其他功能）
+- 需要 Python 3.9+，依赖见 `requirements.txt`（Flask / requests / python-dotenv / oss2 / cos-python-sdk-v5 / PyMySQL / psycopg2-binary / redis）
+- 数据库二选一（由 `DATABASE_SEL` 控制，默认 PostgreSQL）：本地 MySQL（默认 `root/123456`）或 PostgreSQL（默认 `postgres/123456`，库名均默认 `aichat`，启动自动建库建表；MySQL→PG 可在登录页一键迁移）
+- 可选：本地 Redis 服务（对话上下文缓存，`context:{用户名}:{sessionid}` 键保留最近 5 轮问答、1 小时滑动过期；sid 在每次登录时生成，同一账号多次登录/多端登录上下文相互隔离；未启动时自动降级，不影响其他功能）
 - 项目自带 `.venv` 虚拟环境，IDE 运行时会优先使用它；命令行运行请用 `.\.venv\Scripts\python.exe app.py` 或 `py -3 app.py`（系统 PATH 里的 `python` 是微软商店占位符，不可用）
 
 ## 安全说明
