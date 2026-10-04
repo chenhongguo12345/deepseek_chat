@@ -357,6 +357,40 @@
             border-radius: 6px;
         }
         .file-item .del:hover { color: #ef4444; background: #fee2e2; }
+
+        /* Redis 上下文记录 */
+        .ctx-meta {
+            padding: 8px 12px;
+            font-size: 12px;
+            color: #4b5563;
+            background: #f9fafb;
+            border-bottom: 1px solid #eef0f4;
+            line-height: 1.7;
+            word-break: break-all;
+        }
+        .ctx-meta b { color: #1f2937; }
+        .ctx-round {
+            padding: 10px 12px;
+            border-bottom: 1px solid #f0f1f5;
+        }
+        .ctx-round:hover { background: #fafbff; }
+        .ctx-round .idx {
+            font-size: 12px;
+            color: #9ca3af;
+            margin-bottom: 5px;
+            font-weight: 600;
+        }
+        .ctx-round .q, .ctx-round .a {
+            font-size: 13px;
+            line-height: 1.6;
+            word-break: break-word;
+            white-space: pre-wrap;
+        }
+        .ctx-round .q { color: #1d4ed8; margin-bottom: 5px; }
+        .ctx-round .q::before { content: '🙋 问：'; font-weight: 600; }
+        .ctx-round .a { color: #374151; }
+        .ctx-round .a::before { content: '🤖 答：'; font-weight: 600; color: #059669; }
+        .ctx-round .a.empty { color: #9ca3af; font-style: italic; }
     </style>
 </head>
 <body>
@@ -366,6 +400,7 @@
             <span>DeepSeek 结构化对话</span>
             <span class="header-user" title="当前登录用户">👤 {{ session.username }}</span>
             <button class="files-btn" id="filesBtn" title="查看 OSS 上已上传的文件">📁 文件列表</button>
+            <button class="files-btn" id="ctxBtn" title="查看本会话在 Redis 中缓存的最近对话上下文">🧾 对话上下文</button>
             <button class="files-btn" id="certsBtn" title="管理数据库凭证">🔑 凭证管理</button>
             <button class="files-btn" id="logoutBtn" title="退出登录">退出</button>
         </div>
@@ -377,6 +412,16 @@
             </div>
             <div class="files-list" id="filesList">
                 <div class="files-tip">点击"刷新"加载文件...</div>
+            </div>
+        </div>
+        <!-- Redis 对话上下文面板（默认隐藏，展示当前用户当前会话最近 5 轮问答） -->
+        <div class="files-panel" id="ctxPanel">
+            <div class="files-panel-header">
+                <span>本会话对话上下文（Redis · 最近 5 轮）</span>
+                <button class="refresh" id="ctxRefresh">刷新</button>
+            </div>
+            <div class="files-list" id="ctxList">
+                <div class="files-tip">点击"刷新"加载上下文...</div>
             </div>
         </div>
         <div class="chat-messages" id="messages">
@@ -518,6 +563,7 @@
 
         filesBtn.addEventListener('click', () => {
             const opening = !filesPanel.classList.contains('open');
+            ctxPanel.classList.remove('open');  // 与上下文面板互斥，避免重叠
             filesPanel.classList.toggle('open');
             if (opening) loadFiles();  // 每次展开时自动加载一次
         });
@@ -607,6 +653,90 @@
                 alert('删除失败: ' + err.message);
                 delBtn.disabled = false;
                 delBtn.textContent = '🗑';
+            }
+        }
+
+        // ======== Redis 对话上下文查看（当前用户 / 当前 session 最近 5 轮） ========
+        const ctxBtn = document.getElementById('ctxBtn');
+        const ctxPanel = document.getElementById('ctxPanel');
+        const ctxList = document.getElementById('ctxList');
+        const ctxRefresh = document.getElementById('ctxRefresh');
+
+        ctxBtn.addEventListener('click', () => {
+            const opening = !ctxPanel.classList.contains('open');
+            filesPanel.classList.remove('open');  // 与文件面板互斥
+            ctxPanel.classList.toggle('open');
+            if (opening) loadContext();  // 每次展开时自动加载
+        });
+        ctxRefresh.addEventListener('click', loadContext);
+
+        function fmtTTL(sec) {
+            if (!sec || sec <= 0) return '即将过期/无';
+            const m = Math.floor(sec / 60);
+            const s = sec % 60;
+            return m > 0 ? `${m} 分 ${s} 秒` : `${s} 秒`;
+        }
+
+        async function loadContext() {
+            ctxList.innerHTML = '<div class="files-tip">加载中...</div>';
+            try {
+                const resp = await apiFetch('/api/context');
+                const data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || '加载失败');
+                renderContext(data);
+            } catch (err) {
+                ctxList.innerHTML = '<div class="files-tip">⚠ ' + err.message + '</div>';
+            }
+        }
+
+        function esc(s) {
+            return String(s == null ? '' : s);
+        }
+
+        function renderContext(data) {
+            ctxList.innerHTML = '';
+            if (data.available === false) {
+                ctxList.innerHTML = `<div class="files-tip">⚠ ${esc(data.message || 'Redis 不可用')}</div>`;
+                return;
+            }
+
+            // 头部元信息：用户、session、key、TTL、条数
+            const meta = document.createElement('div');
+            meta.className = 'ctx-meta';
+            meta.innerHTML =
+                `<div><b>用户：</b>${esc(data.username)}</div>` +
+                `<div><b>Session：</b>${esc((data.sid || '').slice(0, 16))}…</div>` +
+                `<div><b>Key：</b>${esc(data.redis_key)}</div>` +
+                `<div><b>剩余有效期：</b>${fmtTTL(data.ttl_seconds)}（每次对话滑动续期 1 小时）</div>` +
+                `<div><b>记录：</b>${data.total || 0} / ${data.max_rounds} 轮（仅当前会话可见）</div>`;
+            ctxList.appendChild(meta);
+
+            const rounds = data.rounds || [];
+            if (!rounds.length) {
+                const tip = document.createElement('div');
+                tip.className = 'files-tip';
+                tip.textContent = '本会话还没有对话记录，发送一条消息后再来查看';
+                ctxList.appendChild(tip);
+                return;
+            }
+            for (const rd of rounds) {
+                const box = document.createElement('div');
+                box.className = 'ctx-round';
+
+                const idx = document.createElement('div');
+                idx.className = 'idx';
+                idx.textContent = `第 ${rd.index} 轮`;
+
+                const q = document.createElement('div');
+                q.className = 'q';
+                q.textContent = esc(rd.question);
+
+                const a = document.createElement('div');
+                a.className = 'a' + (rd.answer ? '' : ' empty');
+                a.textContent = rd.answer ? esc(rd.answer) : '（本轮暂无回答）';
+
+                box.append(idx, q, a);
+                ctxList.appendChild(box);
             }
         }
 

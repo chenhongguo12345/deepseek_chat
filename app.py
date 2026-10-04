@@ -13,7 +13,12 @@ import threading
 from functools import wraps
 import requests
 import pymysql
-import redis
+try:
+    import redis  # 可选依赖：未安装时仅停用多轮上下文，不影响程序启动和其他功能
+    _REDIS_MODULE_OK = True
+except ImportError:
+    redis = None
+    _REDIS_MODULE_OK = False
 from urllib.parse import quote
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify, render_template, redirect, session, url_for, g
@@ -27,6 +32,16 @@ app = Flask(__name__, template_folder="templates", static_folder="static")
 # session 加密签名密钥（从 .env 读取，生产环境务必修改）
 app.secret_key = os.getenv("SECRET_KEY", "aichat-dev-secret-key-please-change")
 app.permanent_session_lifetime = timedelta(days=7)
+
+
+@app.after_request
+def _no_cache_html(resp):
+    # HTML 页面不缓存：避免代码更新后浏览器仍使用旧的登录页/主页
+    if resp.headers.get("Content-Type", "").startswith("text/html"):
+        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+    return resp
 
 # ======== 数据库配置（支持 MySQL / PostgreSQL，由 DATABASE_SEL 选择，默认 pgsql） ========
 DATABASE_SEL = os.getenv("DATABASE_SEL", "pgsql").strip().lower()
@@ -55,6 +70,11 @@ REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "") or None
 REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 CONTEXT_TTL_SECONDS = 3600   # 上下文保留时长：1 小时（每次问答滑动续期）
 CONTEXT_MAX_ROUNDS = 5       # 调用大模型时携带的最近问答轮数
+# 历史中每轮 assistant 回复送入模型的最大长度。
+# 原因：DeepSeek 在 response_format=json_object 下，历史里若存在很长的“纯文本”
+# assistant 消息，会触发其约束解码缺陷，content 只返回一串空格（finish_reason=stop）。
+# 历史只需保留语义要点，限长 + 以 JSON 对象形式回传可规避该问题。
+HIST_ANSWER_LIMIT = 300
 
 # ======== DeepSeek 配置 ========
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
@@ -1037,19 +1057,31 @@ _redis_warned = False
 
 
 def get_redis():
-    """获取 Redis 连接（进程内单例）；连接失败返回 None，对话自动降级为无上下文模式"""
+    """获取 Redis 连接（进程内单例）；任何异常/未装包/服务端版本过低都返回 None，
+    对话自动降级为无上下文模式，绝不影响 Flask 启动与其他功能"""
     global _redis_client, _redis_warned
     if _redis_client is None:
         try:
-            r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD,
-                            db=REDIS_DB, socket_connect_timeout=1, socket_timeout=1,
-                            decode_responses=True)
-            r.ping()
+            if not _REDIS_MODULE_OK:
+                raise RuntimeError("未安装 redis Python 包（pip install redis）")
+            common = dict(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD,
+                          db=REDIS_DB, socket_connect_timeout=1, socket_timeout=1,
+                          decode_responses=True)
+            try:
+                # redis-py 5+ 默认 RESP3，握手会发 HELLO 3；
+                # Redis < 6（如 Windows 常见的 3.x/5.x）不支持 HELLO，
+                # 强制 RESP2（Redis 2.x~7.x 全版本兼容）避免连接报错
+                r = redis.Redis(**common, protocol=2)
+                r.ping()
+            except TypeError:
+                # 老版本 redis-py（<4.2）没有 protocol 参数，本就默认 RESP2，直接连接
+                r = redis.Redis(**common)
+                r.ping()
             _redis_client = r
             print(f"[INFO] Redis 已连接: {REDIS_HOST}:{REDIS_PORT}")
         except Exception as e:
             if not _redis_warned:
-                print(f"[WARN] Redis 不可用（{e}），多轮上下文功能停用")
+                print(f"[WARN] Redis 不可用（{e}），多轮上下文功能停用，其余功能不受影响")
                 _redis_warned = True
             return None
     return _redis_client
@@ -1064,8 +1096,22 @@ def _context_key(username):
     return f"context:{username}:{sid}" if sid else f"context:{username}"
 
 
+def _history_assistant_content(item):
+    """把一轮历史转成送入模型的 assistant 消息内容（紧凑 JSON 对象字符串）。
+    - 新格式带 aj（结构化 JSON），直接用；
+    - 旧格式只有纯文本 a（可能很长），截短后包成 {"reply": ...}，
+      既保持与 json_object 模式一致，又规避长纯文本历史导致 DeepSeek 只回空格的缺陷。
+    """
+    aj = item.get("aj")
+    if aj:
+        return aj[:HIST_ANSWER_LIMIT * 2 + 200]
+    reply = (item.get("a") or "")[:HIST_ANSWER_LIMIT]
+    return json.dumps({"reply": reply}, ensure_ascii=False)
+
+
 def load_context_messages(username, max_rounds=CONTEXT_MAX_ROUNDS):
-    """读取用户最近 N 轮问答，展开为 messages 列表（user/assistant 交替）"""
+    """读取用户最近 N 轮问答，展开为 messages 列表（user/assistant 交替）。
+    assistant 历史统一以 JSON 对象字符串形式回传，与 response_format=json_object 保持一致。"""
     r = get_redis()
     if r is None or not username:
         return []
@@ -1079,24 +1125,33 @@ def load_context_messages(username, max_rounds=CONTEXT_MAX_ROUNDS):
                 continue
             if item.get("q"):
                 msgs.append({"role": "user", "content": item["q"]})
-            if item.get("a"):
-                msgs.append({"role": "assistant", "content": item["a"]})
+            aj = _history_assistant_content(item)
+            if aj and json.loads(aj).get("reply"):
+                msgs.append({"role": "assistant", "content": aj})
         return msgs
     except Exception as e:
         print(f"[ERROR] 读取对话上下文失败: {e}")
         return []
 
 
-def save_context_round(username, question, answer):
-    """保存一轮问答；列表只保留最近 CONTEXT_MAX_ROUNDS 轮，1 小时滑动过期"""
+def save_context_round(username, question, structured):
+    """保存一轮问答；列表只保留最近 CONTEXT_MAX_ROUNDS 轮，1 小时滑动过期。
+    structured 为模型返回的结构化 dict，历史里存其紧凑 JSON（aj），保证与 json_object 模式一致。"""
     r = get_redis()
     if r is None or not username:
         return
     try:
+        reply = (structured.get("reply", "") or "")[:HIST_ANSWER_LIMIT]
+        hist_obj = {
+            "reply": reply,
+            "intent": structured.get("intent", ""),
+            "confidence": structured.get("confidence"),
+            "keywords": (structured.get("keywords", []) or [])[:3],
+        }
+        item = {"q": question[:1024], "a": reply, "aj": json.dumps(hist_obj, ensure_ascii=False)}
         key = _context_key(username)
         with r.pipeline() as pipe:
-            pipe.rpush(key, json.dumps({"q": question[:1024], "a": answer[:1024]},
-                                       ensure_ascii=False))
+            pipe.rpush(key, json.dumps(item, ensure_ascii=False))
             pipe.ltrim(key, -CONTEXT_MAX_ROUNDS, -1)
             pipe.expire(key, CONTEXT_TTL_SECONDS)
             pipe.execute()
@@ -1104,7 +1159,89 @@ def save_context_round(username, question, answer):
         print(f"[ERROR] 保存对话上下文失败: {e}")
 
 
+# ======== 查看当前会话上下文（Redis 最近 5 轮） ========
+@app.route("/api/context", methods=["GET"])
+@login_required
+def get_context():
+    """返回【当前登录用户 + 当前 session】在 Redis 中的最近 CONTEXT_MAX_ROUNDS 轮问答。
+    只读本会话（key=context:{用户名}:{sid}），不同登录会话互不可见。"""
+    username = session["username"]
+    sid = session.get("sid") or ""
+    r = get_redis()
+    if r is None:
+        return jsonify({"available": False, "username": username, "sid": sid, "rounds": [],
+                        "message": "Redis 未连接，上下文功能已停用"})
+    try:
+        key = _context_key(username)
+        raws = r.lrange(key, -CONTEXT_MAX_ROUNDS, -1)
+        ttl = r.ttl(key)  # 剩余过期秒数；-1=无过期，-2=key不存在
+        rounds = []
+        for i, raw in enumerate(raws, 1):
+            try:
+                item = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            rounds.append({
+                "index": i,                       # 本页内序号（1..N）
+                "question": item.get("q", ""),
+                "answer": item.get("a", ""),
+            })
+        write_log("CONTEXT_VIEW", _client_ip(), {"username": username, "rounds": len(rounds)})
+        return jsonify({
+            "available": True,
+            "username": username,
+            "sid": sid,
+            "redis_key": key,
+            "ttl_seconds": ttl if isinstance(ttl, int) and ttl > 0 else 0,
+            "max_rounds": CONTEXT_MAX_ROUNDS,
+            "total": len(rounds),
+            "rounds": rounds,
+        })
+    except Exception as e:
+        print(f"[ERROR] 读取上下文记录失败: {e}")
+        return jsonify({"available": False, "username": username, "sid": sid, "rounds": [],
+                        "message": f"读取失败: {e}"}), 500
+
+
 # ======== DeepSeek 对话 ========
+def _deepseek_request(messages, use_json=True):
+    """调用 DeepSeek；use_json=True 时开启 response_format=json_object 约束输出"""
+    payload = {
+        "model": DEEPSEEK_MODEL,
+        "messages": messages,
+        "temperature": 0.7,
+        # 中文一个字约 1-2 token，过小容易触发 finish_reason=length 截断 JSON
+        "max_tokens": 2048,
+    }
+    if use_json:
+        payload["response_format"] = {"type": "json_object"}
+    headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
+    return requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=60)
+
+
+def _coerce_structured(raw):
+    """宽容解析模型输出为结构化 dict：
+    支持纯 JSON、带 ```json 代码块、正文前后有多余文字（截取首个 { 到末个 }）。
+    解析不了或为空返回 None。"""
+    if not raw:
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        pass
+    text = re.sub(r"^```(?:json)?\s*|```\s*$", "", text, flags=re.M).strip()
+    i, j = text.find("{"), text.rfind("}")
+    if i != -1 and j > i:
+        try:
+            return json.loads(text[i:j + 1])
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
 @app.route("/api/chat", methods=["POST"])
 @login_required
 def chat():
@@ -1154,37 +1291,73 @@ def chat():
 
     # 调用 DeepSeek
     # 组装 messages：system 提示词 + 用户最近 5 轮历史上下文（Redis） + 当前问题
-    payload_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    payload_messages.extend(load_context_messages(session["username"]))
-    payload_messages.append({"role": "user", "content": user_content})
-    payload = {
-        "model": DEEPSEEK_MODEL,
-        "messages": payload_messages,
-        "response_format": {"type": "json_object"},
-        "temperature": 0.7,
-        "max_tokens": 800,
-    }
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    context_messages = load_context_messages(session["username"])
+    messages_with_ctx = [{"role": "system", "content": SYSTEM_PROMPT}] + context_messages + \
+                       [{"role": "user", "content": user_content}]
+    messages_no_ctx = [{"role": "system", "content": SYSTEM_PROMPT},
+                       {"role": "user", "content": user_content}]
 
-    try:
-        resp = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=60)
-        resp.raise_for_status()
-    except requests.exceptions.HTTPError:
-        write_log("CHAT_ERROR", _client_ip(), {"message": message, "error": f"DeepSeek API {resp.status_code}"})
-        return jsonify({"error": f"DeepSeek API 调用失败: {resp.status_code} {resp.text[:200]}"}), 502
-    except requests.exceptions.RequestException as e:
-        write_log("CHAT_ERROR", _client_ip(), {"message": message, "error": str(e)[:200]})
-        return jsonify({"error": f"网络请求异常: {str(e)}"}), 502
+    # 多级降级（仅在异常时才进入下一级，正常请求只调用一次）：
+    # 1) 带历史 + 强制 JSON（常规路径）
+    # 2) 不带历史 + 强制 JSON（规避个别历史触发 DeepSeek 只回空格的缺陷）
+    # 3) 带历史 + 普通文本模式（规避 JSON 约束解码异常）
+    # 4) 不带历史 + 普通文本模式（最终兜底）
+    strategies = [
+        (messages_with_ctx, True),
+        (messages_no_ctx, True),
+        (messages_with_ctx, False),
+        (messages_no_ctx, False),
+    ]
+    structured = None
+    last_raw = ""
+    last_error = ""
+    http_fatal = None  # 4xx 等无需重试的错误响应
 
-    try:
-        choice = resp.json()["choices"][0]["message"]["content"]
-        structured = json.loads(choice)
-    except (KeyError, json.JSONDecodeError) as e:
-        write_log("CHAT_ERROR", _client_ip(), {"message": message, "error": f"解析失败: {str(e)}"})
-        return jsonify({"error": f"解析模型返回失败: {str(e)}", "raw": choice if 'choice' in dir() else None}), 502
+    for attempt, (msgs, use_json) in enumerate(strategies):
+        try:
+            resp = _deepseek_request(msgs, use_json=use_json)
+            if resp.status_code != 200:
+                # 4xx（鉴权/参数错误）重试无意义，直接终止
+                if 400 <= resp.status_code < 500:
+                    http_fatal = resp
+                    break
+                last_error = f"DeepSeek API {resp.status_code}"
+                continue
+            resp_data = resp.json()
+            first_choice = resp_data["choices"][0]
+            raw_content = first_choice.get("message", {}).get("content") or ""
+            last_raw = raw_content
+            obj = _coerce_structured(raw_content)
+            if obj is not None and str(obj.get("reply", "")).strip():
+                structured = obj
+                if attempt > 0:
+                    # 走到了降级分支，记录便于排查
+                    write_log("CHAT_FALLBACK", _client_ip(),
+                              {"message": message, "attempt": attempt + 1,
+                               "with_ctx": msgs is messages_with_ctx, "json_mode": use_json})
+                break
+            last_error = ("回答为空" if not raw_content.strip()
+                          else "返回 JSON 缺少 reply 字段")
+        except requests.exceptions.RequestException as e:
+            last_error = f"网络异常: {str(e)[:150]}"
+        except Exception as e:
+            last_error = f"解析失败: {str(e)[:150]}"
+
+    if http_fatal is not None:
+        write_log("CHAT_ERROR", _client_ip(),
+                 {"message": message, "error": f"DeepSeek API {http_fatal.status_code}"})
+        return jsonify({"error": f"DeepSeek API 调用失败: {http_fatal.status_code} {http_fatal.text[:200]}"}), 502
+
+    if structured is None:
+        # 最终兜底：如果拿到了非空纯文本（普通模式下模型可能直接给文字），包装后返回，避免用户看到空回复
+        plain = (last_raw or "").strip()
+        if plain:
+            structured = {"reply": plain[:1024], "intent": "", "confidence": None, "keywords": []}
+            write_log("CHAT_FALLBACK", _client_ip(), {"message": message, "attempt": "plain-wrap"})
+        else:
+            write_log("CHAT_ERROR", _client_ip(),
+                      {"message": message, "error": last_error, "raw_tail": (last_raw or "")[-100:]})
+            return jsonify({"error": f"模型暂时无法给出有效回复（{last_error}），请稍后重试"}), 502
 
     # 记录服务器应答
     write_log("CHAT_AI", _client_ip(),
@@ -1203,9 +1376,9 @@ def chat():
         except Exception as e:
             print(f"[ERROR] 保存模型回答失败: {e}")
 
-    # 本轮问答存入 Redis 上下文（key=用户名，保留最近 5 轮，1 小时滑动过期）
+    # 本轮问答存入 Redis 上下文（key=用户名+sid，保留最近 5 轮，1 小时滑动过期）
     if message:
-        save_context_round(session["username"], message, structured.get("reply", ""))
+        save_context_round(session["username"], message, structured)
 
     structured["user_message"] = message or "(仅附件)"
     return jsonify(structured)

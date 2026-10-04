@@ -7,6 +7,8 @@
 | 功能 | 说明 |
 |------|------|
 | AI 对话 | 调用 DeepSeek 大模型，返回结构化 JSON（reply / intent / confidence / keywords） |
+| 多轮上下文 | Redis 按 `用户名+sessionid` 缓存最近 5 轮问答，调用模型时携带；1 小时滑动过期，多次登录/多端会话互相隔离，异常时多级降级重试 |
+| 上下文查看 | 头部「🧾 对话上下文」面板，查看当前用户、当前 session 在 Redis 中的最近 5 轮问答（含 key、剩余有效期），与文件面板互斥展开 |
 | 文件上传 | 通过页面 ➕ 按钮上传文件到阿里云 OSS（扩展名白名单 + 大小限制） |
 | 附件对话 | 已上传文件可随消息一起发送，作为对话上下文（模型只能看到文件名和链接，读不到内容） |
 | 文件列表 | 页面右上角「📁 文件列表」面板，只列出当前登录用户自己的目录（`chat/{用户名}/`）下的文件 |
@@ -115,6 +117,24 @@ python app.py            # 然后浏览器打开 http://127.0.0.1:5000
 
 安全校验：object key 必须以当前用户目录 `chat/{用户名}/` 开头且不等于前缀本身、不能以 `/` 结尾——防止越权删除本应用目录之外的对象（包括其他用户的文件）。校验通过后调用 `bucket.delete_object()`。返回 `{"ok": true, "object_key": ...}`。
 
+### `GET /api/context` → `get_context()`
+查看**当前登录用户 + 当前 session** 在 Redis 中的最近 5 轮问答上下文（无需请求参数）。返回：
+
+```json
+{
+  "available": true,
+  "username": "zhangsan",
+  "sid": "5b57991e...",
+  "redis_key": "context:zhangsan:5b57991e...",
+  "ttl_seconds": 3211,
+  "max_rounds": 5,
+  "total": 2,
+  "rounds": [{"index": 1, "question": "...", "answer": "..."}]
+}
+```
+
+读取 `context:{用户名}:{当前会话sid}` 的 `LRANGE -5 -1`，只返回可读的 `question/answer`（不返回内部给模型用的结构化 `aj` 字段），并带剩余过期秒数；不同登录会话天然隔离。Redis 未连接时返回 `{"available": false, "message": "Redis 未连接..."}`（HTTP 200，不报错）。每次查看写一条 `CONTEXT_VIEW` 日志。
+
 ### `POST /api/chat` → `chat()`
 请求体：`{"message": "...", "attachments": [{filename, url, size}]}`（两者不能同时为空）。
 
@@ -158,6 +178,8 @@ python app.py            # 然后浏览器打开 http://127.0.0.1:5000
 | `LOGOUT` | `/api/logout` 登出 | 用户名 |
 | `REGISTER` | `/api/register` 注册成功 | 新用户名 |
 | `REGISTER_FAIL` | 注册失败（用户名冲突） | 用户名、失败原因 |
+| `CONTEXT_VIEW` | `GET /api/context` 查看本会话上下文 | 用户名、返回轮数 |
+| `CHAT_FALLBACK` | 主调用返回空/异常后走了降级分支 | 问题、降级级别（尝试次数/纯文本包装） |
 
 IP 获取：优先取 `X-Forwarded-For` 首个地址（部署在 nginx 反代后时为真实 IP），否则取 `request.remote_addr`。日志写入失败只打印控制台错误，不影响业务接口。
 
@@ -169,6 +191,7 @@ IP 获取：优先取 `X-Forwarded-For` 首个地址（部署在 nginx 反代后
   - **聊天**：`sendMessage()` 发送消息+附件到 `/api/chat`，`appendAiMsg()` 渲染回复气泡、意图/置信度/关键词标签和可折叠的原始 JSON
   - **上传**：➕ 按钮触发隐藏的文件选择框，`uploadFile()` 逐个上传到 `/api/upload`，待发送附件在输入框上方的暂存区显示，可单独移除
   - **文件管理**：`loadFiles()` 拉取 `/api/files` 渲染面板列表；⬇ 走 `download_url` 直接下载；🗑 调用 `deleteFile()` 二次确认后发 DELETE 请求，成功后从 DOM 移除该行
+  - **上下文查看**：头部「🧾 对话上下文」按钮，`loadContext()` 拉取 `/api/context`，面板顶部展示用户名/session/Redis key/剩余有效期/条数，下方逐轮展示问与答；与文件面板互斥展开（同一位置），展开时自动刷新
 
 ## 运行环境说明
 
