@@ -1,14 +1,15 @@
 # DeepSeek 结构化对话助手
 
-一个基于 Flask + DeepSeek API + 阿里云 OSS 的 Web 聊天应用。用户发送消息后，后端调用 DeepSeek 大模型并返回**结构化 JSON**（回复正文 + 意图分类 + 置信度 + 关键词）；支持上传文件到 OSS 作为对话附件，并可在页面上管理（预览 / 下载 / 删除）已上传的 OSS 文件。
+一个基于 Flask 的 Web 聊天应用。聊天后端由 `LLM_PROVIDER` 环境变量切换：`deepseek`（默认，调用 DeepSeek 云服务）或 `local`（调用本地 OpenAI 兼容接口，如 Ollama 的 `/v1` 端点）。用户发送消息后，后端调用大模型并返回**结构化 JSON**（回复正文 + 意图分类 + 置信度 + 关键词）；支持上传文件到 OSS 作为对话附件，并可在页面上管理（预览 / 下载 / 删除）已上传的 OSS 文件。
 
 ## 功能总览
 
 | 功能 | 说明 |
 |------|------|
-| AI 对话 | 调用 DeepSeek 大模型，返回结构化 JSON（reply / intent / confidence / keywords） |
+| AI 对话 | 调用大模型（DeepSeek 云服务或本地 Ollama，由 `LLM_PROVIDER` 切换），返回结构化 JSON（reply / intent / confidence / keywords） |
 | 多轮上下文 | Redis 按 `用户名+sessionid` 缓存最近 5 轮问答，调用模型时携带；1 小时滑动过期，多次登录/多端会话互相隔离，异常时多级降级重试 |
 | 上下文查看 | 头部「🧾 对话上下文」面板，查看当前用户、当前 session 在 Redis 中的最近 5 轮问答（含 key、剩余有效期），与文件面板互斥展开 |
+| 语音输入 | 输入框旁 🎤 麦克风按钮，浏览器实时录音（最长 60 秒，不支持文件导入）→ faster-whisper（small 模型 / CPU / int8）转写为文字填入输入框，自动检测语言、中文输出简体，识别结果可编辑后发送 |
 | 文件上传 | 通过页面 ➕ 按钮上传文件到阿里云 OSS（扩展名白名单 + 大小限制） |
 | 附件对话 | 已上传文件可随消息一起发送，作为对话上下文（模型只能看到文件名和链接，读不到内容） |
 | 文件列表 | 页面右上角「📁 文件列表」面板，只列出当前登录用户自己的目录（`chat/{用户名}/`）下的文件 |
@@ -27,7 +28,7 @@
 pip install -r requirements.txt
 
 # 2. 复制并填写配置
-copy .env.example .env   # 然后编辑 .env 填入 DeepSeek Key 和 OSS 凭证
+copy .env.example .env   # 然后编辑 .env：选择 LLM_PROVIDER（deepseek 或 local），填入对应凭证和 OSS 凭证
 
 # 3. 启动
 python app.py            # 然后浏览器打开 http://127.0.0.1:5000
@@ -37,8 +38,12 @@ python app.py            # 然后浏览器打开 http://127.0.0.1:5000
 
 | 变量 | 必填 | 说明 |
 |------|------|------|
-| `DEEPSEEK_API_KEY` | 是 | DeepSeek API Key |
-| `DEEPSEEK_MODEL` | 否 | 模型名，默认 `deepseek-chat` |
+| `LLM_PROVIDER` | 否 | 聊天后端选择：`deepseek`（默认，调用 DeepSeek 云服务）或 `local`（调用本地 OpenAI 兼容接口，如 Ollama 的 `/v1` 端点）。**重启进程生效** |
+| `DEEPSEEK_API_KEY` | deepseek 模式必填 | DeepSeek API Key |
+| `DEEPSEEK_MODEL` | 否 | DeepSeek 模型名，默认 `deepseek-chat` |
+| `LOCAL_BASE_URL` | 否 | 本地兼容端点 base url，默认 `http://localhost:11434/v1` |
+| `LOCAL_MODEL` | local 模式必填 | 本地模型名，必须是本机已下载的模型（如 `llama3.2`、`qwen2.5:7b`，可用 `ollama list` 查看） |
+| `LOCAL_API_KEY` | 否 | 本地端点鉴权 key，Ollama 默认留空即可 |
 | `STORAGE_PROVIDER` | 否 | 对象存储选型：`oss` / `cos` / `auto`（默认 auto，两套都配置时随机选一套，多实例可实现负载分担；只配一套则用那一套）。启动时选定，之后整个进程都用这一套 |
 | `STORAGE_CERT_SEL` | 否 | 存储密钥来源：设为 `db`（小写）时，`OSS_ACCESS_KEY_ID`/`OSS_ACCESS_KEY_SECRET`/`COS_SECRET_ID`/`COS_SECRET_KEY` 四个密钥从 MySQL `certificate` 表读取（`certificatekey` 存键名、`value` 存值），忽略环境变量；默认 `env` 或其他值时沿用环境变量。endpoint/region/bucket 始终取自环境变量 |
 | `OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET` | 二选一 | 阿里云 AccessKey |
@@ -58,6 +63,10 @@ python app.py            # 然后浏览器打开 http://127.0.0.1:5000
 | `PG_DB` | pgsql 模式 | 数据库名，默认 `aichat`（不存在时启动自动创建，也可由登录页迁移按钮创建） |
 | `REDIS_HOST` / `REDIS_PORT` | 否 | Redis 地址 / 端口，默认 `127.0.0.1` / `6379`；Redis 不可用时自动降级为无上下文模式 |
 | `REDIS_PASSWORD` / `REDIS_DB` | 否 | Redis 密码（无密码留空不填）/ 库编号，默认 0 |
+| `WHISPER_MODEL` / `WHISPER_DEVICE` / `WHISPER_COMPUTE` | 否 | 语音识别模型/设备/计算精度，默认 `small` / `cpu` / `int8` |
+| `WHISPER_LANGUAGE` | 否 | 识别语言：留空自动检测，`zh` 固定中文、`en` 固定英文 |
+| `WHISPER_INITIAL_PROMPT` | 否 | 识别提示词，留空时中文自动引导简体；可填人名/术语热词提高专有名词准确率 |
+| `WHISPER_MODEL_DIR` | 否 | 本地模型目录，配置后不从 HuggingFace 下载（离线部署） |
 | `SECRET_KEY` | 否 | session Cookie 签名密钥，生产环境务必改成随机长字符串 |
 
 > 两套存储都未配置时服务仍可启动，聊天功能正常，仅文件相关功能不可用。
@@ -135,10 +144,13 @@ python app.py            # 然后浏览器打开 http://127.0.0.1:5000
 
 读取 `context:{用户名}:{当前会话sid}` 的 `LRANGE -5 -1`，只返回可读的 `question/answer`（不返回内部给模型用的结构化 `aj` 字段），并带剩余过期秒数；不同登录会话天然隔离。Redis 未连接时返回 `{"available": false, "message": "Redis 未连接..."}`（HTTP 200，不报错）。每次查看写一条 `CONTEXT_VIEW` 日志。
 
+### `POST /api/transcribe` → `transcribe_audio()`
+语音识别接口（登录保护）。接收麦克风实时录音：`multipart/form-data`，字段名 `audio`（Chrome/Edge 为 `audio/webm;codecs=opus`，Safari 为 `audio/mp4`，均支持）。后端把音频写入临时文件，调用 **faster-whisper**（`WhisperModel("small", device="cpu", compute_type="int8")`，进程内单例懒加载）转写：`language` 留空时自动检测语言，中文场景通过 `initial_prompt` 引导简体输出，`vad_filter` 过滤静音。返回 `{"text": "识别文本", "language": "zh", "duration": 3.6}`，空音频 400、超 25MB 413、依赖未安装/模型加载失败 503（只停用语音功能，不影响其他功能）。临时音频文件用完即删。
+
 ### `POST /api/chat` → `chat()`
 请求体：`{"message": "...", "attachments": [{filename, url, size}]}`（两者不能同时为空）。
 
-处理流程：**用户提问入库**（`user_question_record` 表，`record_idx` 取该用户当前 `MAX(record_idx)+1`，时间格式 `YYYY-MM-DD HH:MM:SS`，超长问题截断到 1024 字符，入库失败只打印错误不影响对话）→ 组装用户消息（文本 + 附件信息列表）→ **携带上下文调用** DeepSeek（messages = system 提示词 + Redis 中**当前会话**最近 5 轮问答 + 当前问题；`response_format: json_object` 强制 JSON 输出）→ 解析模型返回的 JSON → **回答回写**（`UPDATE` 该记录的 `answer` 字段，同样截断 1024 字符；DeepSeek 调用失败时 answer 留空）→ **本轮问答写入 Redis 上下文**（key `context:{用户名}:{sessionid}`，登录时生成独立 sid，同账号多次登录/多端登录上下文互不影响；保留最近 5 轮，1 小时滑动过期）→ 附加 `user_message` 字段后返回。
+处理流程：**用户提问入库**（`user_question_record` 表，`record_idx` 取该用户当前 `MAX(record_idx)+1`，时间格式 `YYYY-MM-DD HH:MM:SS`，超长问题截断到 1024 字符，入库失败只打印错误不影响对话）→ 组装用户消息（文本 + 附件信息列表）→ **携带上下文调用** 当前 `LLM_PROVIDER` 对应的模型（messages = system 提示词 + Redis 中**当前会话**最近 5 轮问答 + 当前问题；优先用 `response_format: json_object` 强制 JSON 输出；本地模型若不支持 `response_format` 会自动降级到纯文本模式再由 `_coerce_structured` 宽容解析）→ 解析模型返回的 JSON → **回答回写**（`UPDATE` 该记录的 `answer` 字段，同样截断 1024 字符；模型调用失败时 answer 留空）→ **本轮问答写入 Redis 上下文**（key `context:{用户名}:{sessionid}`，登录时生成独立 sid，同账号多次登录/多端登录上下文互不影响；保留最近 5 轮，1 小时滑动过期）→ 附加 `user_message` 字段后返回。
 
 返回结构：
 
@@ -171,14 +183,16 @@ python app.py            # 然后浏览器打开 http://127.0.0.1:5000
 | `DOWNLOAD` | `/api/download` 下载代理被访问 | 文件名、object_key |
 | `DELETE` | `/api/files` DELETE 删除成功 | 文件名、object_key |
 | `CHAT_USER` | `/api/chat` 收到有效询问 | 消息文本、附件文件名列表 |
-| `CHAT_AI` | DeepSeek 应答成功返回 | reply、intent、confidence、keywords |
-| `CHAT_ERROR` | DeepSeek 调用/解析失败 | 消息文本、错误摘要 |
+| `CHAT_AI` | 模型应答成功返回 | reply、intent、confidence、keywords |
+| `CHAT_ERROR` | 模型调用/解析失败 | 消息文本、错误摘要 |
 | `LOGIN` | `/api/login` 登录成功 | 用户名 |
 | `LOGIN_FAIL` | 登录失败（用户名/密码错误、账号停用） | 尝试登录的用户名 |
 | `LOGOUT` | `/api/logout` 登出 | 用户名 |
 | `REGISTER` | `/api/register` 注册成功 | 新用户名 |
 | `REGISTER_FAIL` | 注册失败（用户名冲突） | 用户名、失败原因 |
 | `CONTEXT_VIEW` | `GET /api/context` 查看本会话上下文 | 用户名、返回轮数 |
+| `VOICE_INPUT` | `/api/transcribe` 语音转写成功 | 用户名、识别字数、语言、音频时长、字节数 |
+| `VOICE_ERROR` | 语音转写失败 | 用户名、错误摘要 |
 | `CHAT_FALLBACK` | 主调用返回空/异常后走了降级分支 | 问题、降级级别（尝试次数/纯文本包装） |
 
 IP 获取：优先取 `X-Forwarded-For` 首个地址（部署在 nginx 反代后时为真实 IP），否则取 `request.remote_addr`。日志写入失败只打印控制台错误，不影响业务接口。
@@ -192,12 +206,15 @@ IP 获取：优先取 `X-Forwarded-For` 首个地址（部署在 nginx 反代后
   - **上传**：➕ 按钮触发隐藏的文件选择框，`uploadFile()` 逐个上传到 `/api/upload`，待发送附件在输入框上方的暂存区显示，可单独移除
   - **文件管理**：`loadFiles()` 拉取 `/api/files` 渲染面板列表；⬇ 走 `download_url` 直接下载；🗑 调用 `deleteFile()` 二次确认后发 DELETE 请求，成功后从 DOM 移除该行
   - **上下文查看**：头部「🧾 对话上下文」按钮，`loadContext()` 拉取 `/api/context`，面板顶部展示用户名/session/Redis key/剩余有效期/条数，下方逐轮展示问与答；与文件面板互斥展开（同一位置），展开时自动刷新
+  - **语音输入**：输入框旁 🎤 按钮（`toggleRecording()`），用 `getUserMedia` 打开麦克风、`MediaRecorder` 录音（Chrome/Edge 用 webm/opus、Safari 用 mp4）；录音中按钮红色脉冲并显示秒数，最长 60 秒自动停止，再次点击手动停止；停止后立即释放麦克风、FormData 上传 `/api/transcribe`，识别文本追加到输入框（不自动发送，可编辑）；麦克风权限拒绝、无设备、浏览器不支持均有明确提示
 
 ## 运行环境说明
 
-- 需要 Python 3.9+，依赖见 `requirements.txt`（Flask / requests / python-dotenv / oss2 / cos-python-sdk-v5 / PyMySQL / psycopg2-binary / redis）
+- 需要 Python 3.9+，依赖见 `requirements.txt`（Flask / requests / python-dotenv / oss2 / cos-python-sdk-v5 / PyMySQL / psycopg2-binary / redis / faster-whisper）
 - 数据库二选一（由 `DATABASE_SEL` 控制，默认 PostgreSQL）：本地 MySQL（默认 `root/123456`）或 PostgreSQL（默认 `postgres/123456`，库名均默认 `aichat`，启动自动建库建表；MySQL→PG 可在登录页一键迁移）
 - 可选：本地 Redis 服务（对话上下文缓存，`context:{用户名}:{sessionid}` 键保留最近 5 轮问答、1 小时滑动过期；sid 在每次登录时生成，同一账号多次登录/多端登录上下文相互隔离；未启动时自动降级，不影响其他功能）
+- 可选：语音输入依赖 `faster-whisper`（pip 安装即可，无需单独安装 ffmpeg——PyAV wheel 自带解码器，webm/opus 和 mp4 均可识别）。模型 `small` 在**首次使用语音功能时**从 HuggingFace 下载（约 460MB，缓存到 `~/.cache/huggingface`，之后离线可用；国内下载慢可在启动前设置环境变量 `HF_ENDPOINT=https://hf-mirror.com`，或提前下载模型并配置 `WHISPER_MODEL_DIR`）。模型加载是进程内单例懒加载，不影响服务启动；未安装该依赖时仅语音按钮报"不可用"，其余功能正常
+- 浏览器麦克风要求页面运行在 **localhost 或 HTTPS** 下（`http://局域网IP` 会被浏览器直接禁止麦克风），首次点击 🎤 需在弹窗中允许麦克风权限
 - 项目自带 `.venv` 虚拟环境，IDE 运行时会优先使用它；命令行运行请用 `.\.venv\Scripts\python.exe app.py` 或 `py -3 app.py`（系统 PATH 里的 `python` 是微软商店占位符，不可用）
 
 ## 安全说明

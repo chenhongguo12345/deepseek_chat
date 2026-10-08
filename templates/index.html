@@ -225,6 +225,34 @@
         }
         .plus-btn:hover { border-color: #667eea; background: #f5f7ff; }
         .plus-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        /* 麦克风语音输入按钮 */
+        .mic-btn {
+            width: 42px; height: 42px;
+            border: 2px solid #e5e5ea;
+            background: white;
+            border-radius: 10px;
+            font-size: 19px;
+            color: #667eea;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+            flex-shrink: 0;
+        }
+        .mic-btn:hover:not(:disabled) { border-color: #667eea; background: #f5f7ff; }
+        .mic-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        /* 录音中：红色脉冲状态 */
+        .mic-btn.recording {
+            border-color: #ef4444;
+            background: #fef2f2;
+            color: #ef4444;
+            animation: mic-pulse 1.2s ease-in-out infinite;
+        }
+        @keyframes mic-pulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(239,68,68,0.35); }
+            50% { box-shadow: 0 0 0 7px rgba(239,68,68,0); }
+        }
         /* 用户消息里的附件展示 */
         .msg-attachments {
             margin-top: 6px;
@@ -435,6 +463,7 @@
                    accept=".jpg,.jpeg,.png,.gif,.webp,.bmp,.pdf,.txt,.md,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.csv">
             <button class="plus-btn" id="plusBtn" onclick="fileInput.click()" title="上传文件到 OSS">+</button>
             <input type="text" id="input" placeholder="输入消息后回车发送..." autocomplete="off">
+            <button class="mic-btn" id="micBtn" title="语音输入：点击开始录音，再点停止并识别（最长 60 秒）">🎤</button>
             <button id="sendBtn" onclick="sendMessage()">发送</button>
         </div>
     </div>
@@ -475,6 +504,129 @@
         inputEl.addEventListener('keydown', (e) => {
             if (e.key === 'Enter' && !sendBtn.disabled) sendMessage();
         });
+
+        // ======== 麦克风语音输入（仅实时录音，不支持文件导入；最长 60 秒） ========
+        const micBtn = document.getElementById('micBtn');
+        const MIC_MAX_SECONDS = 60;
+        let mediaRecorder = null;
+        let micChunks = [];
+        let micStream = null;
+        let micTimer = null;
+        let micSeconds = 0;
+        let micMime = 'audio/webm';
+
+        micBtn.addEventListener('click', toggleRecording);
+
+        function setRecordingUI(on) {
+            micBtn.classList.toggle('recording', on);
+            micBtn.textContent = on ? '⏹' : '🎤';
+            micBtn.title = on
+                ? `录音中 ${micSeconds}s，点击停止并识别（最长 ${MIC_MAX_SECONDS} 秒）`
+                : '语音输入：点击开始录音，再点停止并识别（最长 60 秒）';
+            inputEl.placeholder = on
+                ? `🎙 录音中 ${micSeconds} 秒，再次点击麦克风停止...`
+                : '输入消息后回车发送...';
+        }
+
+        async function toggleRecording() {
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                mediaRecorder.stop();  // onstop 中统一收尾、上传
+                return;
+            }
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia ||
+                typeof MediaRecorder === 'undefined') {
+                alert('当前浏览器不支持麦克风录音，请使用最新版 Chrome / Edge / Safari');
+                return;
+            }
+            try {
+                micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            } catch (err) {
+                if (err.name === 'NotAllowedError' || err.name === 'SecurityError') {
+                    alert('麦克风权限被拒绝，请点击浏览器地址栏的权限图标允许使用麦克风后重试');
+                } else if (err.name === 'NotFoundError') {
+                    alert('未检测到麦克风设备');
+                } else {
+                    alert('无法打开麦克风：' + err.message);
+                }
+                return;
+            }
+
+            // Chrome/Edge 优先 webm/opus；Safari 用 mp4
+            let options = {};
+            if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+                options.mimeType = 'audio/webm;codecs=opus';
+                micMime = 'audio/webm';
+            } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
+                options.mimeType = 'audio/mp4';
+                micMime = 'audio/mp4';
+            } else {
+                micMime = MediaRecorder.isTypeSupported('audio/ogg') ? 'audio/ogg' : 'audio/webm';
+            }
+
+            micChunks = [];
+            micSeconds = 0;
+            try {
+                mediaRecorder = new MediaRecorder(micStream, options);
+            } catch (err) {
+                micStream.getTracks().forEach(t => t.stop());
+                micStream = null;
+                alert('无法创建录音：' + err.message);
+                return;
+            }
+            mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) micChunks.push(e.data); };
+            mediaRecorder.onstop = onRecordingStop;
+            mediaRecorder.start();
+            setRecordingUI(true);
+            micTimer = setInterval(() => {
+                micSeconds++;
+                setRecordingUI(true);
+                if (micSeconds >= MIC_MAX_SECONDS && mediaRecorder &&
+                    mediaRecorder.state === 'recording') {
+                    mediaRecorder.stop();  // 到 60 秒自动停止
+                }
+            }, 1000);
+        }
+
+        async function onRecordingStop() {
+            clearInterval(micTimer);
+            // 立即释放麦克风（指示灯熄灭）
+            if (micStream) {
+                micStream.getTracks().forEach(t => t.stop());
+                micStream = null;
+            }
+            setRecordingUI(false);
+
+            const blob = new Blob(micChunks, { type: micMime });
+            micChunks = [];
+            if (blob.size < 800) {
+                alert('录音时间太短，请按住麦克风多讲一会儿');
+                return;
+            }
+
+            micBtn.disabled = true;
+            inputEl.placeholder = '🎧 正在识别语音，请稍候...（首次使用服务器需加载语音模型）';
+            try {
+                const ext = micMime.includes('mp4') ? 'm4a'
+                    : micMime.includes('ogg') ? 'ogg' : 'webm';
+                const fd = new FormData();
+                fd.append('audio', blob, 'recording.' + ext);
+                const resp = await apiFetch('/api/transcribe', { method: 'POST', body: fd });
+                const data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || '识别失败');
+                if (data.text && data.text.trim()) {
+                    // 识别结果填入输入框（保留原有文字，不自动发送，供用户确认/编辑）
+                    inputEl.value = (inputEl.value ? inputEl.value + ' ' : '') + data.text.trim();
+                    inputEl.focus();
+                } else {
+                    alert('没有识别到语音内容，请靠近麦克风、环境安静些再试');
+                }
+            } catch (err) {
+                alert('语音识别失败：' + err.message);
+            } finally {
+                micBtn.disabled = false;
+                inputEl.placeholder = '输入消息后回车发送...';
+            }
+        }
 
         // 文件选择 -> 上传
         const MAX_SIZE = 10 * 1024 * 1024; // 10MB，与后端一致

@@ -9,6 +9,7 @@ import json
 import uuid
 import time
 import random
+import tempfile
 import threading
 from functools import wraps
 import requests
@@ -19,6 +20,13 @@ try:
 except ImportError:
     redis = None
     _REDIS_MODULE_OK = False
+try:
+    # 可选依赖：语音输入。未安装或模型加载失败时仅停用麦克风识别，不影响其他功能
+    from faster_whisper import WhisperModel
+    _WHISPER_MODULE_OK = True
+except ImportError:
+    WhisperModel = None
+    _WHISPER_MODULE_OK = False
 from urllib.parse import quote
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify, render_template, redirect, session, url_for, g
@@ -70,16 +78,44 @@ REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "") or None
 REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 CONTEXT_TTL_SECONDS = 3600   # 上下文保留时长：1 小时（每次问答滑动续期）
 CONTEXT_MAX_ROUNDS = 5       # 调用大模型时携带的最近问答轮数
+
+# ======== 语音识别（faster-whisper）配置 ========
+# 模型规格：默认 small + CPU；compute_type 在 CPU 上用 int8（快且省内存）
+WHISPER_MODEL = (os.getenv("WHISPER_MODEL", "small") or "small").strip()
+WHISPER_DEVICE = (os.getenv("WHISPER_DEVICE", "cpu") or "cpu").strip()
+WHISPER_COMPUTE = (os.getenv("WHISPER_COMPUTE", "int8") or "int8").strip()
+# 识别语言：留空=自动检测；可固定为 zh / en 等
+WHISPER_LANGUAGE = (os.getenv("WHISPER_LANGUAGE", "") or "").strip() or None
+# 初始提示：留空时，中文（含自动检测）场景默认引导输出简体中文——
+# Whisper small 中文默认常输出繁体，initial_prompt 可纠偏；也可放人名/术语热词提升专有名词准确率
+WHISPER_INITIAL_PROMPT = (os.getenv("WHISPER_INITIAL_PROMPT", "") or "").strip()
+# 可选：本地模型目录（配置后不从网络下载）
+WHISPER_MODEL_DIR = (os.getenv("WHISPER_MODEL_DIR", "") or "").strip()
+# 上传音频大小上限（字节），默认 25MB（约对应 60 秒录音）
+WHISPER_MAX_AUDIO_BYTES = int(os.getenv("WHISPER_MAX_AUDIO_BYTES", str(25 * 1024 * 1024)))
 # 历史中每轮 assistant 回复送入模型的最大长度。
 # 原因：DeepSeek 在 response_format=json_object 下，历史里若存在很长的“纯文本”
 # assistant 消息，会触发其约束解码缺陷，content 只返回一串空格（finish_reason=stop）。
 # 历史只需保留语义要点，限长 + 以 JSON 对象形式回传可规避该问题。
 HIST_ANSWER_LIMIT = 300
 
-# ======== DeepSeek 配置 ========
+# ======== 大模型（LLM）配置 ========
+# LLM_PROVIDER 决定聊天用哪个模型后端：
+#   deepseek（默认）= 调用 DeepSeek 云服务（需要 DEEPSEEK_API_KEY）
+#   local           = 调用本地 OpenAI 兼容接口（如 Ollama 的 /v1 端点，http://localhost:11434/v1）
+LLM_PROVIDER = (os.getenv("LLM_PROVIDER", "deepseek") or "deepseek").strip().lower()
+
+# ---- DeepSeek 云服务 ----
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+
+# ---- 本地模型（OpenAI 兼容端点，如 Ollama） ----
+# Ollama 默认在 http://localhost:11434/v1 提供兼容 OpenAI 的 /chat/completions 接口
+LOCAL_BASE_URL = os.getenv("LOCAL_BASE_URL", "http://localhost:11434/v1").rstrip("/")
+LOCAL_MODEL = os.getenv("LOCAL_MODEL", "llama3.2")  # 必须是本机 ollama list 里已下载的模型名
+# 本地 Ollama 默认不需要鉴权；若你的兼容端点需要 key 可在此配置
+LOCAL_API_KEY = os.getenv("LOCAL_API_KEY", "")
 
 # ======== 对象存储配置（OSS / COS 启动时二选一） ========
 # STORAGE_PROVIDER=oss 强制用阿里云 OSS；=cos 强制用腾讯云 COS；
@@ -1203,11 +1239,121 @@ def get_context():
                         "message": f"读取失败: {e}"}), 500
 
 
-# ======== DeepSeek 对话 ========
-def _deepseek_request(messages, use_json=True):
-    """调用 DeepSeek；use_json=True 时开启 response_format=json_object 约束输出"""
+# ======== 语音识别（faster-whisper，small / CPU） ========
+_whisper_model = None
+_whisper_load_error = None
+_whisper_lock = threading.Lock()
+
+
+def get_whisper_model():
+    """懒加载 Whisper 模型单例（首次调用时加载，约几百 MB，首次还会从 HuggingFace 下载）。
+    任何失败只记录错误并返回 None，由接口给出 503，不影响程序启动和其他功能。"""
+    global _whisper_model, _whisper_load_error
+    if _whisper_model is not None:
+        return _whisper_model
+    if not _WHISPER_MODULE_OK:
+        _whisper_load_error = "服务器未安装 faster-whisper（pip install faster-whisper）"
+        return None
+    with _whisper_lock:  # 多请求同时首次调用时只加载一次
+        if _whisper_model is None and not _whisper_load_error:
+            model_ref = WHISPER_MODEL_DIR or WHISPER_MODEL
+            try:
+                print(f"[INFO] 正在加载 Whisper 模型: {model_ref} "
+                      f"(device={WHISPER_DEVICE}, compute_type={WHISPER_COMPUTE})；"
+                      f"首次使用会下载模型，请耐心等待...")
+                _whisper_model = WhisperModel(model_ref, device=WHISPER_DEVICE,
+                                              compute_type=WHISPER_COMPUTE)
+                print("[INFO] Whisper 模型加载完成")
+            except Exception as e:
+                _whisper_load_error = str(e)
+                print(f"[ERROR] Whisper 模型加载失败: {e}")
+    return _whisper_model
+
+
+@app.route("/api/transcribe", methods=["POST"])
+@login_required
+def transcribe_audio():
+    """接收麦克风录音（multipart/form-data，字段名 audio），转写为文本返回。
+    仅接受实时录音上传，不提供文件导入入口。"""
+    username = session["username"]
+    f = request.files.get("audio")
+    if f is None:
+        return jsonify({"error": "缺少音频文件（字段名 audio）"}), 400
+
+    data = f.read()
+    if not data:
+        return jsonify({"error": "录音内容为空"}), 400
+    if len(data) > WHISPER_MAX_AUDIO_BYTES:
+        return jsonify({"error": "录音过大（上限 25MB / 约 60 秒）"}), 413
+
+    model = get_whisper_model()
+    if model is None:
+        return jsonify({"error": f"语音识别不可用：{_whisper_load_error or '模型未加载'}"}), 503
+
+    # 按浏览器 MediaRecorder 的实际格式给临时文件后缀（faster-whisper 用 PyAV 解码）
+    mimetype = (f.mimetype or "").lower()
+    filename = (f.filename or "").lower()
+    if "wav" in mimetype or filename.endswith(".wav"):
+        suffix = ".wav"
+    elif "mp4" in mimetype or "m4a" in mimetype or filename.endswith((".mp4", ".m4a")):
+        suffix = ".m4a"  # Safari 录音为 audio/mp4
+    elif "ogg" in mimetype or filename.endswith(".ogg"):
+        suffix = ".ogg"
+    else:
+        suffix = ".webm"  # Chrome/Edge 默认 audio/webm;codecs=opus
+
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(suffix=suffix, prefix="voice_")
+        with os.fdopen(fd, "wb") as wf:
+            wf.write(data)
+
+        # language=None 自动检测；vad_filter 过滤静音段，短录音识别更稳
+        transcribe_kwargs = dict(language=WHISPER_LANGUAGE, beam_size=5, vad_filter=True)
+        # 中文场景（含自动检测）默认引导简体输出；用户可通过 WHISPER_INITIAL_PROMPT 覆盖或加热词
+        prompt = WHISPER_INITIAL_PROMPT
+        if not prompt and WHISPER_LANGUAGE in (None, "zh"):
+            prompt = "以下是普通话的句子，请使用简体中文。"
+        if prompt:
+            transcribe_kwargs["initial_prompt"] = prompt
+        segments, info = model.transcribe(tmp_path, **transcribe_kwargs)
+        text = "".join(seg.text for seg in segments).strip()
+        write_log("VOICE_INPUT", _client_ip(),
+                  {"username": username, "chars": len(text),
+                   "language": getattr(info, "language", None),
+                   "duration": round(getattr(info, "duration", 0) or 0, 1),
+                   "bytes": len(data)})
+        return jsonify({"text": text, "language": getattr(info, "language", None),
+                        "duration": round(getattr(info, "duration", 0) or 0, 1)})
+    except Exception as e:
+        print(f"[ERROR] 语音转写失败: {e}")
+        write_log("VOICE_ERROR", _client_ip(), {"username": username, "error": str(e)[:200]})
+        return jsonify({"error": f"语音识别失败：{str(e)[:200]}"}), 500
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+# ======== 大模型对话 ========
+def _llm_endpoint():
+    """根据 LLM_PROVIDER 返回 (url, model, api_key, provider_name)"""
+    if LLM_PROVIDER == "local":
+        return (f"{LOCAL_BASE_URL}/chat/completions", LOCAL_MODEL,
+                LOCAL_API_KEY, "local")
+    return (DEEPSEEK_URL, DEEPSEEK_MODEL, DEEPSEEK_API_KEY, "deepseek")
+
+
+def _llm_request(messages, use_json=True):
+    """调用当前 LLM_PROVIDER 对应的模型后端。
+    use_json=True 时开启 response_format=json_object 约束输出 JSON。
+    本地模型（如部分 Ollama 版本）若不支持 response_format 会返回 400，
+    由调用方降级到 use_json=False 重试。"""
+    url, model, api_key, provider = _llm_endpoint()
     payload = {
-        "model": DEEPSEEK_MODEL,
+        "model": model,
         "messages": messages,
         "temperature": 0.7,
         # 中文一个字约 1-2 token，过小容易触发 finish_reason=length 截断 JSON
@@ -1215,8 +1361,10 @@ def _deepseek_request(messages, use_json=True):
     }
     if use_json:
         payload["response_format"] = {"type": "json_object"}
-    headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
-    return requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=60)
+    # Ollama 兼容端点要求 Authorization 头存在但不校验内容；没 key 时用占位
+    auth_key = api_key or ("ollama" if provider == "local" else "")
+    headers = {"Authorization": f"Bearer {auth_key}", "Content-Type": "application/json"}
+    return requests.post(url, headers=headers, json=payload, timeout=60)
 
 
 def _coerce_structured(raw):
@@ -1253,8 +1401,13 @@ def chat():
     if not message and not attachments:
         return jsonify({"error": "消息和附件不能同时为空"}), 400
 
-    if not DEEPSEEK_API_KEY:
-        return jsonify({"error": "服务器未配置 DEEPSEEK_API_KEY，请在 .env 中设置"}), 500
+    # 按当前 provider 做前置校验
+    if LLM_PROVIDER == "local":
+        if not LOCAL_MODEL:
+            return jsonify({"error": "服务器未配置 LOCAL_MODEL（本地模型名），请在 .env 中设置"}), 500
+    else:
+        if not DEEPSEEK_API_KEY:
+            return jsonify({"error": "服务器未配置 DEEPSEEK_API_KEY，请在 .env 中设置"}), 500
 
     # 记录用户询问（含附件文件名列表）
     write_log("CHAT_USER", _client_ip(),
@@ -1315,13 +1468,19 @@ def chat():
 
     for attempt, (msgs, use_json) in enumerate(strategies):
         try:
-            resp = _deepseek_request(msgs, use_json=use_json)
+            resp = _llm_request(msgs, use_json=use_json)
             if resp.status_code != 200:
-                # 4xx（鉴权/参数错误）重试无意义，直接终止
+                # 4xx 处理：
+                # - 本地模型不支持 response_format 时会在 use_json=True 返回 400，
+                #   这种情况应降级到 use_json=False 重试，不应直接 fatal。
+                # - 仅在 use_json=False（无 response_format）仍 4xx，或 DeepSeek 4xx 时视为致命错误。
                 if 400 <= resp.status_code < 500:
+                    if use_json and LLM_PROVIDER == "local":
+                        last_error = f"本地模型不支持 JSON 模式（{resp.status_code}），降级到纯文本"
+                        continue
                     http_fatal = resp
                     break
-                last_error = f"DeepSeek API {resp.status_code}"
+                last_error = f"模型 API {resp.status_code}"
                 continue
             resp_data = resp.json()
             first_choice = resp_data["choices"][0]
@@ -1345,8 +1504,8 @@ def chat():
 
     if http_fatal is not None:
         write_log("CHAT_ERROR", _client_ip(),
-                 {"message": message, "error": f"DeepSeek API {http_fatal.status_code}"})
-        return jsonify({"error": f"DeepSeek API 调用失败: {http_fatal.status_code} {http_fatal.text[:200]}"}), 502
+                 {"message": message, "error": f"模型 API {http_fatal.status_code}"})
+        return jsonify({"error": f"模型 API 调用失败: {http_fatal.status_code} {http_fatal.text[:200]}"}), 502
 
     if structured is None:
         # 最终兜底：如果拿到了非空纯文本（普通模式下模型可能直接给文字），包装后返回，避免用户看到空回复
@@ -1385,8 +1544,16 @@ def chat():
 
 
 if __name__ == "__main__":
-    if not DEEPSEEK_API_KEY:
-        print("[WARN] 未检测到 DEEPSEEK_API_KEY")
+    if LLM_PROVIDER == "local":
+        if not LOCAL_MODEL:
+            print("[WARN] 未配置 LOCAL_MODEL（本地模型名），聊天功能不可用")
+        else:
+            print(f"[INFO] LLM: 本地模型 {LOCAL_MODEL} @ {LOCAL_BASE_URL}")
+    else:
+        if not DEEPSEEK_API_KEY:
+            print("[WARN] 未检测到 DEEPSEEK_API_KEY，聊天功能不可用")
+        else:
+            print(f"[INFO] LLM: DeepSeek 云服务（{DEEPSEEK_MODEL}）")
     # 初始化数据库（自动建库建表、创建默认管理员）
     try:
         init_db()
